@@ -378,6 +378,7 @@ with col1:
 
 # --- MAPA FOLIUM (PRAWA STRONA) ---
 with col2:
+    # Używamy jasnej, minimalistycznej mapy jako tła
     m = folium.Map(location=st.session_state.centroid_wgs84, zoom_start=st.session_state.zoom_start, tiles="CartoDB positron")
     
     if st.session_state.main_polygon:
@@ -385,30 +386,48 @@ with col2:
         trans = Transformer.from_crs(epsg, "EPSG:4326", always_xy=True)
         all_wgs_coords = []
         
+        # Rysowanie krawędzi ewidencji (Cienkie, ale klikalne)
         for idx, edge in enumerate(st.session_state.edges):
             c_wgs = [trans.transform(x, y)[::-1] for x, y in edge.coords] 
             all_wgs_coords.extend(c_wgs)
             
-            color = 'black'
-            if idx == st.session_state.public_road_idx: color = 'red'
-            elif idx == st.session_state.inner_road_idx: color = 'orange'
+            color = '#333333' # Ciemnoszary, jak zablokowana warstwa w CAD
+            weight = 3        # Chudsze linie bazowe
             
-            folium.PolyLine(locations=c_wgs, color=color, weight=8, tooltip=f"Krawędź nr: {idx}").add_to(m)
+            if idx == st.session_state.public_road_idx: 
+                color = 'red'
+                weight = 4
+            elif idx == st.session_state.inner_road_idx: 
+                color = 'orange'
+                weight = 4
+            
+            folium.PolyLine(locations=c_wgs, color=color, weight=weight, tooltip=f"Krawędź nr: {idx}").add_to(m)
 
+        # Rysowanie zaprojektowanych działek (STYL CAD - wireframe, brak wypełnienia)
         if st.session_state.sub_parcels:
             for i, p in enumerate(st.session_state.sub_parcels):
                 p_geoms = p.geoms if hasattr(p, 'geoms') else [p]
                 for g in p_geoms:
                     if g.geom_type == 'Polygon':
                         c_wgs = [trans.transform(x, y)[::-1] for x, y in g.exterior.coords]
-                        folium.Polygon(locations=c_wgs, color='blue', fill=True, fill_opacity=0.3, tooltip=f"Dz. {i+1} ({p.area:.0f}m²)").add_to(m)
+                        # fill=False usuwa szrafurę
+                        folium.Polygon(locations=c_wgs, color='blue', weight=2, fill=False, tooltip=f"Dz. {i+1} ({p.area:.0f}m²)").add_to(m)
         
+        # Rysowanie drogi wewnętrznej (STYL CAD)
         if st.session_state.road_polygon:
             r_geoms = st.session_state.road_polygon.geoms if hasattr(st.session_state.road_polygon, 'geoms') else [st.session_state.road_polygon]
             for g in r_geoms:
                 if g.geom_type == 'Polygon':
                     c_wgs = [trans.transform(x, y)[::-1] for x, y in g.exterior.coords]
-                    folium.Polygon(locations=c_wgs, color='yellow', fill=True, fill_opacity=0.6).add_to(m)
+                    folium.Polygon(locations=c_wgs, color='#ff8800', weight=2, fill=False).add_to(m)
+                    
+        # Rysowanie resztówki (Przerywana linia)
+        if st.session_state.remainder_parcel:
+            rem_geoms = st.session_state.remainder_parcel.geoms if hasattr(st.session_state.remainder_parcel, 'geoms') else [st.session_state.remainder_parcel]
+            for g in rem_geoms:
+                if g.geom_type == 'Polygon':
+                    c_wgs = [trans.transform(x, y)[::-1] for x, y in g.exterior.coords]
+                    folium.Polygon(locations=c_wgs, color='red', weight=2, dash_array='5, 5', fill=False, tooltip=f"Reszta ({g.area:.0f}m²)").add_to(m)
             
         if all_wgs_coords: m.fit_bounds(all_wgs_coords)
 
