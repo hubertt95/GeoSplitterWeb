@@ -18,7 +18,7 @@ st.set_page_config(layout="wide", page_title="AI GeoSplitter Web", page_icon="�
 if 'original_parcels' not in st.session_state:
     st.session_state.update({
         'original_parcels': [], 'main_polygon': None, 'edges': [],
-        'public_road_idx': None, 'inner_road_idx': None,
+        'public_road_idx': None, 'inner_road_indices': [], # LISTA DO WIELU KRAWĘDZI
         'sub_parcels': [], 'remainder_parcel': None, 'road_polygon': None,
         'cut_lines': [], 'centroid_wgs84': [52.0, 19.0], 'zoom_start': 6,
         'picking_mode': 'Oczekiwanie', 'epsg_code': 'EPSG:2178'
@@ -41,17 +41,13 @@ def _cut_parcel(poly, v_cut, v_sweep, target_area, cut_from_back=False):
     cx, cy, sx, sy = v_cut[0], v_cut[1], v_sweep[0], v_sweep[1]
     c_point = poly.centroid
     
-    # NAPRAWA BŁĘDU (MultiPolygon crash)
     coords = []
     if poly.geom_type == 'Polygon':
         coords = list(poly.exterior.coords)
     elif hasattr(poly, 'geoms'):
         for g in poly.geoms:
-            if g.geom_type == 'Polygon':
-                coords.extend(list(g.exterior.coords))
-                
-    if not coords:
-        return None, None, None
+            if g.geom_type == 'Polygon': coords.extend(list(g.exterior.coords))
+    if not coords: return None, None, None
 
     projections = [(x - c_point.x)*sx + (y - c_point.y)*sy for x, y in coords]
     t_low, t_high = min(projections), max(projections)
@@ -142,7 +138,7 @@ def fetch_data(ids_str):
     st.session_state.edges = edges
     
     st.session_state.public_road_idx = None
-    st.session_state.inner_road_idx = None
+    st.session_state.inner_road_indices = []
     st.session_state.sub_parcels = []
     st.session_state.road_polygon = None
     st.session_state.remainder_parcel = None
@@ -153,7 +149,7 @@ def fetch_data(ids_str):
 # 3. GENEROWANIE KONCEPCJI
 # ==========================================
 def run_design(road_width, road_pos, road_end, turnaround, t_size, last_area, cut_angle, target_area, exact_count, remainder_mode):
-    if not st.session_state.main_polygon or st.session_state.public_road_idx is None or st.session_state.inner_road_idx is None:
+    if not st.session_state.main_polygon or st.session_state.public_road_idx is None or not st.session_state.inner_road_indices:
         st.warning("Najpierw wskaż na mapie Drogę Gminną (kliknij czerwoną opcję) i Wewnętrzną (pomarańczową opcję).")
         return
 
@@ -165,7 +161,13 @@ def run_design(road_width, road_pos, road_end, turnaround, t_size, last_area, cu
     
     st.session_state.sub_parcels, st.session_state.remainder_parcel, st.session_state.cut_lines = [], None, []
 
-    inner_path = edges[st.session_state.inner_road_idx]
+    # Integracja wielu krawędzi wewnętrznych
+    inner_lines = [edges[i] for i in sorted(st.session_state.inner_road_indices)]
+    inner_path = unary_union(inner_lines)
+    if inner_path.geom_type == 'MultiLineString':
+        try: inner_path = shapely.ops.linemerge(inner_path)
+        except: inner_path = inner_lines[0]
+
     ext_path = _extend_line(inner_path, 2000)
     c = list(ext_path.coords)
     dx, dy = c[-1][0]-c[0][0], c[-1][1]-c[0][1]
@@ -294,14 +296,15 @@ with col1:
         if st.button("Pobierz Geometrię"): fetch_data(ids_input)
 
     with st.expander("2. Interaktywny Kontekst z Mapy", expanded=True):
-        st.write("Kliknij najpierw przycisk tutaj, a potem linię na mapie:")
+        st.write("Wybierz tryb i klikaj krawędzie na mapie obok:")
         c_mode1, c_mode2 = st.columns(2)
         with c_mode1:
-            if st.button("🔴 Wybierz Gminną"): st.session_state.picking_mode = 'public'
+            if st.button("🔴 Wybierz Gminną (1x)"): st.session_state.picking_mode = 'public'
         with c_mode2:
-            if st.button("🟠 Wybierz Wewnętrzną"): st.session_state.picking_mode = 'inner'
+            if st.button("🟠 Wybierz Wewnętrzną (Wiele)"): st.session_state.picking_mode = 'inner'
             
-        st.info(f"Oczekujący tryb klikania mapy: **{st.session_state.picking_mode}**")
+        status_color = "red" if st.session_state.picking_mode == 'public' else "orange" if st.session_state.picking_mode == 'inner' else "gray"
+        st.markdown(f"Status wyboru na mapie: <b style='color:{status_color};'>{st.session_state.picking_mode.upper()}</b>", unsafe_allow_html=True)
             
     with st.expander("3. Architektura Drogi", expanded=False):
         road_width = st.slider("Szerokość drogi (m):", 5.0, 15.0, 8.0)
@@ -325,13 +328,11 @@ with col1:
     if st.session_state.sub_parcels:
         st.markdown("### 📊 Raport Projektu")
         for i, p in enumerate(st.session_state.sub_parcels):
-            # Obliczenia rozmiarów
             mbr = p.minimum_rotated_rectangle
             c = list(mbr.exterior.coords)
             s1 = math.hypot(c[1][0]-c[0][0], c[1][1]-c[0][1])
             s2 = math.hypot(c[2][0]-c[1][0], c[2][1]-c[1][1])
             w, l = min(s1, s2), max(s1, s2)
-            
             st.markdown(f"**Dz. {i+1}** - Pow: **{p.area:.0f} m²** (Wymiar: ~{w:.1f} m x {l:.1f} m)")
         
         if st.session_state.remainder_parcel:
@@ -378,7 +379,6 @@ with col1:
 
 # --- MAPA FOLIUM (PRAWA STRONA) ---
 with col2:
-    # Używamy jasnej, minimalistycznej mapy jako tła
     m = folium.Map(location=st.session_state.centroid_wgs84, zoom_start=st.session_state.zoom_start, tiles="CartoDB positron")
     
     if st.session_state.main_polygon:
@@ -386,34 +386,35 @@ with col2:
         trans = Transformer.from_crs(epsg, "EPSG:4326", always_xy=True)
         all_wgs_coords = []
         
-        # Rysowanie krawędzi ewidencji (Cienkie, ale klikalne)
+        # 1. Rysowanie Ewidencji (Krawędzie)
         for idx, edge in enumerate(st.session_state.edges):
             c_wgs = [trans.transform(x, y)[::-1] for x, y in edge.coords] 
             all_wgs_coords.extend(c_wgs)
             
-            color = '#333333' # Ciemnoszary, jak zablokowana warstwa w CAD
-            weight = 3        # Chudsze linie bazowe
-            
-            if idx == st.session_state.public_road_idx: 
-                color = 'red'
-                weight = 4
-            elif idx == st.session_state.inner_road_idx: 
-                color = 'orange'
-                weight = 4
+            color, weight = '#333333', 3
+            if idx == st.session_state.public_road_idx: color, weight = 'red', 5
+            elif idx in st.session_state.inner_road_indices: color, weight = 'orange', 5
             
             folium.PolyLine(locations=c_wgs, color=color, weight=weight, tooltip=f"Krawędź nr: {idx}").add_to(m)
 
-        # Rysowanie zaprojektowanych działek (STYL CAD - wireframe, brak wypełnienia)
+        # 2. Rysowanie ZAPROJEKTOWANYCH DZIAŁEK (CAD STYLE + OPISY W ŚRODKU)
         if st.session_state.sub_parcels:
             for i, p in enumerate(st.session_state.sub_parcels):
                 p_geoms = p.geoms if hasattr(p, 'geoms') else [p]
                 for g in p_geoms:
                     if g.geom_type == 'Polygon':
                         c_wgs = [trans.transform(x, y)[::-1] for x, y in g.exterior.coords]
-                        # fill=False usuwa szrafurę
-                        folium.Polygon(locations=c_wgs, color='blue', weight=2, fill=False, tooltip=f"Dz. {i+1} ({p.area:.0f}m²)").add_to(m)
+                        folium.Polygon(locations=c_wgs, color='blue', weight=2, fill=False).add_to(m)
+                        
+                        # ETYKIETA W CENTRUM DZIAŁKI (HTML z białym obrysem)
+                        wgs_cent = trans.transform(g.centroid.x, g.centroid.y)[::-1]
+                        label_html = f"""
+                        <div style='font-family: Arial, sans-serif; font-size: 11px; font-weight: bold; color: black; text-align: center; text-shadow: 1px 1px 2px white, -1px -1px 2px white, 1px -1px 2px white, -1px 1px 2px white;'>
+                            Dz. {i+1}<br>{p.area:.0f}
+                        </div>"""
+                        folium.Marker(location=wgs_cent, icon=folium.DivIcon(html=label_html, icon_size=(100, 30), icon_anchor=(50, 15))).add_to(m)
         
-        # Rysowanie drogi wewnętrznej (STYL CAD)
+        # 3. Rysowanie Drogi
         if st.session_state.road_polygon:
             r_geoms = st.session_state.road_polygon.geoms if hasattr(st.session_state.road_polygon, 'geoms') else [st.session_state.road_polygon]
             for g in r_geoms:
@@ -421,27 +422,34 @@ with col2:
                     c_wgs = [trans.transform(x, y)[::-1] for x, y in g.exterior.coords]
                     folium.Polygon(locations=c_wgs, color='#ff8800', weight=2, fill=False).add_to(m)
                     
-        # Rysowanie resztówki (Przerywana linia)
+        # 4. Rysowanie Resztówki
         if st.session_state.remainder_parcel:
             rem_geoms = st.session_state.remainder_parcel.geoms if hasattr(st.session_state.remainder_parcel, 'geoms') else [st.session_state.remainder_parcel]
             for g in rem_geoms:
                 if g.geom_type == 'Polygon':
                     c_wgs = [trans.transform(x, y)[::-1] for x, y in g.exterior.coords]
-                    folium.Polygon(locations=c_wgs, color='red', weight=2, dash_array='5, 5', fill=False, tooltip=f"Reszta ({g.area:.0f}m²)").add_to(m)
+                    folium.Polygon(locations=c_wgs, color='red', weight=2, dash_array='5, 5', fill=False).add_to(m)
+                    wgs_cent = trans.transform(g.centroid.x, g.centroid.y)[::-1]
+                    label_html = f"<div style='font-family: Arial; font-size: 10px; font-weight: bold; color: red; text-align: center; text-shadow: 1px 1px 1px white;'>Reszta<br>{g.area:.0f}</div>"
+                    folium.Marker(location=wgs_cent, icon=folium.DivIcon(html=label_html, icon_size=(80, 30), icon_anchor=(40, 15))).add_to(m)
             
         if all_wgs_coords: m.fit_bounds(all_wgs_coords)
 
     st_data = st_folium(m, width=900, height=750)
     
+    # OBSŁUGA KLIKANIA MAPY
     if st_data['last_object_clicked_tooltip']:
         try:
             clicked_idx = int(st_data['last_object_clicked_tooltip'].replace("Krawędź nr: ", ""))
             if st.session_state.picking_mode == 'public':
                 st.session_state.public_road_idx = clicked_idx
-                st.session_state.picking_mode = 'Oczekiwanie'
+                st.session_state.picking_mode = 'Oczekiwanie' # Resetujemy, bo gminna jest tylko 1
                 st.rerun()
             elif st.session_state.picking_mode == 'inner':
-                st.session_state.inner_road_idx = clicked_idx
-                st.session_state.picking_mode = 'Oczekiwanie'
-                st.rerun()
+                # Wielokrotny wybór!
+                if clicked_idx in st.session_state.inner_road_indices:
+                    st.session_state.inner_road_indices.remove(clicked_idx)
+                else:
+                    st.session_state.inner_road_indices.append(clicked_idx)
+                st.rerun() # Przeładowujemy UI by krawędź zaświeciła się natychmiast
         except: pass
