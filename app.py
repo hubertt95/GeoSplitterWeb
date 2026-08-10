@@ -40,7 +40,19 @@ def _extend_line(line, dist=2000):
 def _cut_parcel(poly, v_cut, v_sweep, target_area, cut_from_back=False):
     cx, cy, sx, sy = v_cut[0], v_cut[1], v_sweep[0], v_sweep[1]
     c_point = poly.centroid
-    coords = list(poly.exterior.coords)
+    
+    # NAPRAWA BŁĘDU (MultiPolygon crash)
+    coords = []
+    if poly.geom_type == 'Polygon':
+        coords = list(poly.exterior.coords)
+    elif hasattr(poly, 'geoms'):
+        for g in poly.geoms:
+            if g.geom_type == 'Polygon':
+                coords.extend(list(g.exterior.coords))
+                
+    if not coords:
+        return None, None, None
+
     projections = [(x - c_point.x)*sx + (y - c_point.y)*sy for x, y in coords]
     t_low, t_high = min(projections), max(projections)
     best_cut, best_rem, best_line, best_diff = None, None, None, float('inf')
@@ -100,7 +112,6 @@ def fetch_data(ids_str):
         st.error("Nie znaleziono działek. Sprawdź numery TERYT.")
         return
 
-    # EPSG:2180 to EPSG:2000 & WGS84
     temp_union = unary_union([g for _, g in raw_polygons])
     trans_to_wgs = Transformer.from_crs("EPSG:2180", "EPSG:4326", always_xy=True)
     lon, lat = trans_to_wgs.transform(temp_union.centroid.x, temp_union.centroid.y)
@@ -108,9 +119,8 @@ def fetch_data(ids_str):
     st.session_state.centroid_wgs84 = [lat, lon]
     st.session_state.zoom_start = 18
     
-    # Detekcja właściwej strefy układu 2000
     epsg_2000 = "EPSG:2176" if lon < 16.5 else "EPSG:2177" if lon < 19.5 else "EPSG:2178" if lon < 22.5 else "EPSG:2179"
-    st.session_state.epsg_code = epsg_2000 # Zapisujemy poprawny EPSG!
+    st.session_state.epsg_code = epsg_2000 
     
     trans_to_2000 = Transformer.from_crs("EPSG:2180", epsg_2000, always_xy=True)
 
@@ -137,7 +147,7 @@ def fetch_data(ids_str):
     st.session_state.road_polygon = None
     st.session_state.remainder_parcel = None
     st.session_state.picking_mode = 'Oczekiwanie'
-    st.success(f"Pobrano {len(original_2000)} działek. Układ: {epsg_2000}. Gotowe do wyboru krawędzi na mapie obok!")
+    st.success(f"Pobrano {len(original_2000)} działek. Układ: {epsg_2000}. Gotowe do wyboru krawędzi.")
 
 # ==========================================
 # 3. GENEROWANIE KONCEPCJI
@@ -280,7 +290,7 @@ col1, col2 = st.columns([1, 2])
 
 with col1:
     with st.expander("1. GUGiK Data (EPSG:2000)", expanded=True):
-        ids_input = st.text_input("ID Działki (TERYT):", "261104_2.0007.421,261104_2.0007.422")
+        ids_input = st.text_input("ID Działki (TERYT):", "143411_4.0001.172")
         if st.button("Pobierz Geometrię"): fetch_data(ids_input)
 
     with st.expander("2. Interaktywny Kontekst z Mapy", expanded=True):
@@ -311,7 +321,23 @@ with col1:
     if st.button("🚀 Wygeneruj Projekt Podziału", use_container_width=True, type="primary"):
         run_design(road_width, road_pos, road_end, turnaround, t_size, last_area, cut_angle, target_area, exact_count, remainder_mode)
 
+    # === SEKCJA RAPORTU ===
     if st.session_state.sub_parcels:
+        st.markdown("### 📊 Raport Projektu")
+        for i, p in enumerate(st.session_state.sub_parcels):
+            # Obliczenia rozmiarów
+            mbr = p.minimum_rotated_rectangle
+            c = list(mbr.exterior.coords)
+            s1 = math.hypot(c[1][0]-c[0][0], c[1][1]-c[0][1])
+            s2 = math.hypot(c[2][0]-c[1][0], c[2][1]-c[1][1])
+            w, l = min(s1, s2), max(s1, s2)
+            
+            st.markdown(f"**Dz. {i+1}** - Pow: **{p.area:.0f} m²** (Wymiar: ~{w:.1f} m x {l:.1f} m)")
+        
+        if st.session_state.remainder_parcel:
+            st.markdown(f"**Reszta:** {st.session_state.remainder_parcel.area:.0f} m²")
+
+        # === EKSPORT DXF ===
         try:
             doc = ezdxf.new('R2010')
             msp = doc.modelspace()
@@ -323,24 +349,31 @@ with col1:
 
             for orig in st.session_state.original_parcels:
                 if orig['geom'].geom_type == 'Polygon': msp.add_lwpolyline(list(orig['geom'].exterior.coords), close=True, dxfattribs={'layer': 'EWIDENCJA'})
+            
             if st.session_state.road_polygon:
-                msp.add_lwpolyline(list(st.session_state.road_polygon.exterior.coords), close=True, dxfattribs={'layer': 'DROGA_PROJ'})
+                r_geoms = st.session_state.road_polygon.geoms if hasattr(st.session_state.road_polygon, 'geoms') else [st.session_state.road_polygon]
+                for g in r_geoms:
+                    if g.geom_type == 'Polygon': msp.add_lwpolyline(list(g.exterior.coords), close=True, dxfattribs={'layer': 'DROGA_PROJ'})
+            
             for i, p in enumerate(st.session_state.sub_parcels):
-                c = list(p.exterior.coords)
-                msp.add_lwpolyline(c, close=True, dxfattribs={'layer': 'GRANICE_PROJ'})
-                msp.add_text(f"Dz.{i+1} pow. {p.area:.0f} m2", dxfattribs={'layer': 'OPISY', 'height': 2.0}).set_placement((p.centroid.x, p.centroid.y))
-                for j in range(len(c)-1):
-                    dx, dy = c[j+1][0]-c[j][0], c[j+1][1]-c[j][1]
-                    dist = math.hypot(dx, dy)
-                    if dist > 2.0:
-                        adeg = math.degrees(math.atan2(dy, dx))
-                        if adeg > 90 or adeg <= -90: adeg += 180
-                        dt = msp.add_text(f"-{dist:.2f}-", dxfattribs={'layer': 'WYMIARY', 'height': 1.0, 'rotation': adeg})
-                        dt.set_placement(((c[j][0]+c[j+1][0])/2, (c[j][1]+c[j+1][1])/2), align=TextEntityAlignment.MIDDLE_CENTER)
+                p_geoms = p.geoms if hasattr(p, 'geoms') else [p]
+                for poly in p_geoms:
+                    if poly.geom_type != 'Polygon': continue
+                    c = list(poly.exterior.coords)
+                    msp.add_lwpolyline(c, close=True, dxfattribs={'layer': 'GRANICE_PROJ'})
+                    msp.add_text(f"Dz.{i+1} pow. {poly.area:.0f} m2", dxfattribs={'layer': 'OPISY', 'height': 2.0}).set_placement((poly.centroid.x, poly.centroid.y))
+                    for j in range(len(c)-1):
+                        dx, dy = c[j+1][0]-c[j][0], c[j+1][1]-c[j][1]
+                        dist = math.hypot(dx, dy)
+                        if dist > 2.0:
+                            adeg = math.degrees(math.atan2(dy, dx))
+                            if adeg > 90 or adeg <= -90: adeg += 180
+                            dt = msp.add_text(f"-{dist:.2f}-", dxfattribs={'layer': 'WYMIARY', 'height': 1.0, 'rotation': adeg})
+                            dt.set_placement(((c[j][0]+c[j+1][0])/2, (c[j][1]+c[j+1][1])/2), align=TextEntityAlignment.MIDDLE_CENTER)
 
             buffer = io.StringIO()
             doc.write(buffer)
-            st.download_button("💾 Pobierz plik DXF", data=buffer.getvalue(), file_name="geo_podzial.dxf", mime="application/dxf")
+            st.download_button("💾 Pobierz DXF (EPSG:2000)", data=buffer.getvalue(), file_name="geo_podzial.dxf", mime="application/dxf")
         except Exception as e: st.error(f"Błąd DXF: {e}")
 
 # --- MAPA FOLIUM (PRAWA STRONA) ---
@@ -348,15 +381,12 @@ with col2:
     m = folium.Map(location=st.session_state.centroid_wgs84, zoom_start=st.session_state.zoom_start, tiles="CartoDB positron")
     
     if st.session_state.main_polygon:
-        # Odczytujemy właściwy kod EPSG zapisany w fetch_data
         epsg = st.session_state.get('epsg_code', 'EPSG:2178')
         trans = Transformer.from_crs(epsg, "EPSG:4326", always_xy=True)
-        
         all_wgs_coords = []
         
-        # Rysowanie krawędzi do wyboru (Klikalne)
         for idx, edge in enumerate(st.session_state.edges):
-            c_wgs = [trans.transform(x, y)[::-1] for x, y in edge.coords] # [lat, lon]
+            c_wgs = [trans.transform(x, y)[::-1] for x, y in edge.coords] 
             all_wgs_coords.extend(c_wgs)
             
             color = 'black'
@@ -365,22 +395,25 @@ with col2:
             
             folium.PolyLine(locations=c_wgs, color=color, weight=8, tooltip=f"Krawędź nr: {idx}").add_to(m)
 
-        # Rysowanie zaprojektowanych działek po przeliczeniu
         if st.session_state.sub_parcels:
             for i, p in enumerate(st.session_state.sub_parcels):
-                c_wgs = [trans.transform(x, y)[::-1] for x, y in p.exterior.coords]
-                folium.Polygon(locations=c_wgs, color='blue', fill=True, fill_opacity=0.3, tooltip=f"Dz. {i+1} ({p.area:.0f}m²)").add_to(m)
+                p_geoms = p.geoms if hasattr(p, 'geoms') else [p]
+                for g in p_geoms:
+                    if g.geom_type == 'Polygon':
+                        c_wgs = [trans.transform(x, y)[::-1] for x, y in g.exterior.coords]
+                        folium.Polygon(locations=c_wgs, color='blue', fill=True, fill_opacity=0.3, tooltip=f"Dz. {i+1} ({p.area:.0f}m²)").add_to(m)
+        
         if st.session_state.road_polygon:
-            c_wgs = [trans.transform(x, y)[::-1] for x, y in st.session_state.road_polygon.exterior.coords]
-            folium.Polygon(locations=c_wgs, color='yellow', fill=True, fill_opacity=0.6).add_to(m)
+            r_geoms = st.session_state.road_polygon.geoms if hasattr(st.session_state.road_polygon, 'geoms') else [st.session_state.road_polygon]
+            for g in r_geoms:
+                if g.geom_type == 'Polygon':
+                    c_wgs = [trans.transform(x, y)[::-1] for x, y in g.exterior.coords]
+                    folium.Polygon(locations=c_wgs, color='yellow', fill=True, fill_opacity=0.6).add_to(m)
             
-        # Zmuszenie mapy by wykadrowała się do granic działki
-        if all_wgs_coords:
-            m.fit_bounds(all_wgs_coords)
+        if all_wgs_coords: m.fit_bounds(all_wgs_coords)
 
     st_data = st_folium(m, width=900, height=750)
     
-    # Przechwytywanie kliknięć
     if st_data['last_object_clicked_tooltip']:
         try:
             clicked_idx = int(st_data['last_object_clicked_tooltip'].replace("Krawędź nr: ", ""))
