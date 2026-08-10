@@ -21,42 +21,36 @@ if 'original_parcels' not in st.session_state:
         'public_road_idx': None, 'inner_road_indices': [],
         'sub_parcels': [], 'remainder_parcel': None, 'road_polygon': None,
         'cut_lines': [], 'centroid_wgs84': [52.0, 19.0], 'zoom_start': 6,
-        'picking_mode': 'Oczekiwanie', 'epsg_code': 'EPSG:2178'
+        'picking_mode': 'Oczekiwanie', 'epsg_code': 'EPSG:2178',
+        # Dodajemy zmienne parametrów do śledzenia stanu UI "na żywo"
+        'road_width': 8.0, 'road_pos': "Przy krawędzi (Bok)", 'road_end': "Do samego końca działki",
+        'turnaround': False, 't_size': 12.5, 'last_area': 1500.0, 'cut_angle': "Prostopadle do drogi wewn.",
+        'div_type': "Docelowa pow. (m²)", 'target_area': 1000.0, 'exact_count': 5,
+        'remainder_mode': "Wydziel osobną resztówkę"
     })
 
 # ==========================================
 # 1. FUNKCJE POMOCNICZE I MATEMATYCZNE
 # ==========================================
 def _extend_polyline(line, dist=2000):
-    """HYBRYDA: Rozciąga pierwszy i ostatni segment polilinii w nieskończoność, 
-    zachowując wszystkie punkty zagięcia w środku."""
     if line.geom_type == 'MultiLineString':
         try: line = shapely.ops.linemerge(line)
         except: line = line.geoms[0]
-        
     c = list(line.coords)
     if len(c) < 2: return line
-    
-    # Wydłużenie pierwszego segmentu w tył
     dx1, dy1 = c[0][0]-c[1][0], c[0][1]-c[1][1]
     l1 = math.hypot(dx1, dy1)
     p_start = (c[0][0] + dx1/l1*dist, c[0][1] + dy1/l1*dist) if l1 else c[0]
-    
-    # Wydłużenie ostatniego segmentu w przód
     dx2, dy2 = c[-1][0]-c[-2][0], c[-1][1]-c[-2][1]
     l2 = math.hypot(dx2, dy2)
     p_end = (c[-1][0] + dx2/l2*dist, c[-1][1] + dy2/l2*dist) if l2 else c[-1]
-    
-    # Złożenie nowej polilinii ze starym środkiem
     return LineString([p_start] + c[1:-1] + [p_end])
 
 def _cut_parcel(poly, v_cut, v_sweep, target_area, cut_from_back=False):
     cx, cy, sx, sy = v_cut[0], v_cut[1], v_sweep[0], v_sweep[1]
     c_point = poly.centroid
-    
     coords = []
-    if poly.geom_type == 'Polygon':
-        coords = list(poly.exterior.coords)
+    if poly.geom_type == 'Polygon': coords = list(poly.exterior.coords)
     elif hasattr(poly, 'geoms'):
         for g in poly.geoms:
             if g.geom_type == 'Polygon': coords.extend(list(g.exterior.coords))
@@ -105,7 +99,6 @@ def _cut_parcel(poly, v_cut, v_sweep, target_area, cut_from_back=False):
 def fetch_data(ids_str):
     ids = [i.strip() for i in ids_str.split(',') if i.strip()]
     if not ids: return
-    
     raw_polygons = []
     for teryt_id in ids:
         url = f"https://uldk.gugik.gov.pl/?request=GetParcelById&id={teryt_id}&result=geom_wkt"
@@ -156,21 +149,24 @@ def fetch_data(ids_str):
     st.session_state.road_polygon = None
     st.session_state.remainder_parcel = None
     st.session_state.picking_mode = 'Oczekiwanie'
-    st.success(f"Pobrano {len(original_2000)} działek. Układ: {epsg_2000}. Gotowe do wyboru krawędzi.")
+    st.success(f"Pobrano {len(original_2000)} działek. Gotowe do wyboru krawędzi.")
+    
+    # Wymuszamy aktualizację UI po pobraniu nowych danych
+    trigger_redesign()
 
 # ==========================================
-# 3. GENEROWANIE KONCEPCJI (Z HYBRYDĄ)
+# 3. GENEROWANIE KONCEPCJI (LIVE)
 # ==========================================
-def run_design(road_width, road_pos, road_end, turnaround, t_size, last_area, cut_angle, target_area, exact_count, remainder_mode):
+def trigger_redesign():
+    """Funkcja wywoływana przy KAŻDEJ zmianie na suwaku lub liście rozwijanej."""
     if not st.session_state.main_polygon or st.session_state.public_road_idx is None or not st.session_state.inner_road_indices:
-        st.warning("Najpierw wskaż na mapie Drogę Gminną (kliknij czerwoną opcję) i Wewnętrzną (pomarańczową opcję).")
-        return
+        return # Nic nie robimy, dopóki nie ma wskazanych krawędzi
 
     main_poly = st.session_state.main_polygon
     edges = st.session_state.edges
-    rw = road_width
-    is_middle = road_pos == "Środek Działki"
-    stop_at_last = road_end == "Zatrzymaj przed ostatnią działką"
+    rw = st.session_state.road_width
+    is_middle = st.session_state.road_pos == "Środek Działki"
+    stop_at_last = st.session_state.road_end == "Zatrzymaj przed ostatnią działką"
     
     st.session_state.sub_parcels, st.session_state.remainder_parcel, st.session_state.cut_lines = [], None, []
 
@@ -180,9 +176,7 @@ def run_design(road_width, road_pos, road_end, turnaround, t_size, last_area, cu
         try: inner_path = shapely.ops.linemerge(inner_path)
         except: inner_path = inner_lines[0]
         
-    # Używamy HYBRYDOWEGO rozszerzania wielokątów by zachować wszystkie krzywizny
     ext_path = _extend_polyline(inner_path, 2000)
-    
     c_overall = list(ext_path.coords)
     dx_ov, dy_ov = c_overall[-1][0]-c_overall[0][0], c_overall[-1][1]-c_overall[0][1]
     l_len = math.hypot(dx_ov, dy_ov)
@@ -191,15 +185,12 @@ def run_design(road_width, road_pos, road_end, turnaround, t_size, last_area, cu
     cx, cy = main_poly.centroid.x - c_overall[0][0], main_poly.centroid.y - c_overall[0][1]
     if cx*nx + cy*ny < 0: nx, ny = -nx, -ny
 
-    # HYBRYDA TWORZENIA DROGI
     if is_middle:
         projections = [(pt[0]-c_overall[0][0])*nx + (pt[1]-c_overall[0][1])*ny for pt in main_poly.exterior.coords]
         offset = max(projections) / 2
         road_centerline = affinity.translate(ext_path, xoff=nx*offset, yoff=ny*offset)
         full_road_base = road_centerline.buffer(rw/2, cap_style=2)
     else:
-        # Ponieważ ext_path podąża za kształtem krawędzi, wystarczy zwykły buffer!
-        # Używamy cap_style=2 (płaskie zakończenia), by po odcięciu do main_polygon było idealnie brzytwa.
         full_road_base = ext_path.buffer(rw, cap_style=2)
 
     pub_edge = edges[st.session_state.public_road_idx]
@@ -207,6 +198,7 @@ def run_design(road_width, road_pos, road_end, turnaround, t_size, last_area, cu
     pdx, pdy = px2[0]-px1[0], px2[1]-px1[1]
     plen = math.hypot(pdx, pdy)
     
+    cut_angle = st.session_state.cut_angle
     if cut_angle == "Prostopadle do drogi wewn.": v_cut = (nx, ny)
     elif cut_angle == "Prostopadle do drogi gminnej": v_cut = (-pdy/plen, pdx/plen)
     else: v_cut = (pdx/plen, pdy/plen)
@@ -217,12 +209,13 @@ def run_design(road_width, road_pos, road_end, turnaround, t_size, last_area, cu
 
     back_parcel, working_polygon = None, main_poly
     if stop_at_last:
-        back_parcel, working_polygon, _ = _cut_parcel(main_poly, v_cut, v_sweep, last_area, cut_from_back=True)
+        last_a = st.session_state.last_area
+        back_parcel, working_polygon, _ = _cut_parcel(main_poly, v_cut, v_sweep, last_a, cut_from_back=True)
         if back_parcel is None: working_polygon = main_poly
 
     road_poly = full_road_base.intersection(working_polygon)
 
-    if turnaround and road_poly.geom_type == 'Polygon':
+    if st.session_state.turnaround and road_poly.geom_type == 'Polygon':
         try:
             if is_middle: c_line = road_centerline
             else: c_line = affinity.translate(ext_path, xoff=nx*(rw/2), yoff=ny*(rw/2))
@@ -236,15 +229,14 @@ def run_design(road_width, road_pos, road_end, turnaround, t_size, last_area, cu
             if clipped_c.geom_type == 'LineString':
                 coords = list(clipped_c.coords)
                 end_pt, prev_pt = (coords[-1], coords[-2]) if pub_edge.distance(Point(coords[-1])) > pub_edge.distance(Point(coords[0])) else (coords[0], coords[1])
-                    
                 rx, ry = prev_pt[0] - end_pt[0], prev_pt[1] - end_pt[1]
                 l = math.hypot(rx, ry)
                 rx, ry = (rx/l, ry/l) if l > 0 else (0, 0)
                 
-                # Zastosowanie lokalnego wektora do idealnego wyprostowania stempla
                 lnx, lny = -ry, rx
                 if lnx*nx + lny*ny < 0: lnx, lny = -lnx, -lny
                 
+                t_size = st.session_state.t_size
                 if is_middle:
                     C1, C2 = (end_pt[0] + lnx*(t_size/2), end_pt[1] + lny*(t_size/2)), (end_pt[0] - lnx*(t_size/2), end_pt[1] - lny*(t_size/2))
                 else:
@@ -264,13 +256,18 @@ def run_design(road_width, road_pos, road_end, turnaround, t_size, last_area, cu
 
     geoms = [net_poly] if net_poly.geom_type == 'Polygon' else net_poly.geoms
     
+    div_type = st.session_state.div_type
+    target_area = st.session_state.target_area if div_type == "Docelowa pow. (m²)" else 1000.0
+    exact_count = st.session_state.exact_count if div_type != "Docelowa pow. (m²)" else None
+    rem_mode = st.session_state.remainder_mode
+
     for geom in geoms:
         rem_poly = geom
         cuts_needed = exact_count - 1 if exact_count else 999
         cuts_made = 0
         
         side_target = target_area
-        if remainder_mode == "Rozrzuć po równo na wszystkie" and not exact_count:
+        if rem_mode == "Rozrzuć po równo na wszystkie" and not exact_count:
             num_fit = int(rem_poly.area // target_area)
             if num_fit > 0: side_target = rem_poly.area / num_fit
         
@@ -292,9 +289,9 @@ def run_design(road_width, road_pos, road_end, turnaround, t_size, last_area, cu
         if rem_poly and rem_poly.area > 5.0:
             if exact_count: st.session_state.sub_parcels.append(rem_poly)
             else:
-                if remainder_mode == "Dołącz do ostatniej działki" and st.session_state.sub_parcels:
+                if rem_mode == "Dołącz do ostatniej działki" and st.session_state.sub_parcels:
                     st.session_state.sub_parcels[-1] = unary_union([st.session_state.sub_parcels[-1], rem_poly])
-                elif remainder_mode == "Rozrzuć po równo na wszystkie":
+                elif rem_mode == "Rozrzuć po równo na wszystkie":
                     st.session_state.sub_parcels.append(rem_poly)
                 else:
                     st.session_state.remainder_parcel = rem_poly
@@ -304,57 +301,155 @@ def run_design(road_width, road_pos, road_end, turnaround, t_size, last_area, cu
 # ==========================================
 # 4. INTERFEJS STREAMLIT (UI)
 # ==========================================
-st.title("🗺️ AI GeoSplitter - Generative Design")
+st.title("🗺️ AI GeoSplitter - Generative Design (Real-Time)")
 
-col1, col2 = st.columns([1, 2])
+# === PODZIAŁ NA 3 KOLUMNY ===
+col_left, col_mid, col_right = st.columns([1.2, 2.5, 1.2])
 
-with col1:
+# --- LEWA KOLUMNA: Ustawienia (Z triggerami na żywo) ---
+with col_left:
     with st.expander("1. GUGiK Data (EPSG:2000)", expanded=True):
         ids_input = st.text_input("ID Działki (TERYT):", "143411_4.0001.172")
         if st.button("Pobierz Geometrię"): fetch_data(ids_input)
 
-    with st.expander("2. Interaktywny Kontekst z Mapy", expanded=True):
-        st.write("Wybierz tryb i klikaj krawędzie na mapie obok:")
-        c_mode1, c_mode2 = st.columns(2)
-        with c_mode1:
-            if st.button("🔴 Wybierz Gminną (1x)"): st.session_state.picking_mode = 'public'
-        with c_mode2:
-            if st.button("🟠 Wybierz Wewnętrzną (Wiele)"): st.session_state.picking_mode = 'inner'
+    with st.expander("2. Krawędzie (Map Picking)", expanded=True):
+        c_m1, c_m2 = st.columns(2)
+        with c_m1:
+            if st.button("🔴 Gminna (1x)"): st.session_state.picking_mode = 'public'
+        with c_m2:
+            if st.button("🟠 Wewn. (Wiele)"): st.session_state.picking_mode = 'inner'
+        st.markdown(f"Tryb: **{st.session_state.picking_mode}**")
             
-        status_color = "red" if st.session_state.picking_mode == 'public' else "orange" if st.session_state.picking_mode == 'inner' else "gray"
-        st.markdown(f"Status wyboru na mapie: <b style='color:{status_color};'>{st.session_state.picking_mode.upper()}</b>", unsafe_allow_html=True)
+    with st.expander("3. Droga Wewnętrzna", expanded=True):
+        st.slider("Szerokość drogi (m):", 5.0, 15.0, key='road_width', on_change=trigger_redesign)
+        st.selectbox("Pozycja:", ["Przy krawędzi (Bok)", "Środek Działki"], key='road_pos', on_change=trigger_redesign)
+        st.selectbox("Zakończenie:", ["Do samego końca działki", "Zatrzymaj przed ostatnią działką"], key='road_end', on_change=trigger_redesign)
+        
+        # Pokaż głębokość tylko jeśli wybrano "Zatrzymaj przed ostatnią"
+        if st.session_state.road_end == "Zatrzymaj przed ostatnią działką":
+            st.number_input("Pow. ost. działki (m²):", min_value=1.0, step=50.0, key='last_area', on_change=trigger_redesign)
             
-    with st.expander("3. Architektura Drogi", expanded=False):
-        road_width = st.slider("Szerokość drogi (m):", 5.0, 15.0, 8.0)
-        road_pos = st.selectbox("Pozycja:", ["Przy krawędzi (Bok)", "Środek Działki"])
-        road_end = st.selectbox("Zakończenie:", ["Do samego końca działki", "Zatrzymaj przed ostatnią działką"])
-        last_area = st.number_input("Pow. ost. działki (m²):", value=1500)
-        turnaround = st.checkbox("Dodaj plac do zawracania")
-        t_size = st.number_input("Wymiar placu (m):", value=12.5)
+        st.checkbox("Dodaj plac do zawracania", key='turnaround', on_change=trigger_redesign)
+        if st.session_state.turnaround:
+            st.number_input("Wymiar placu (m):", min_value=1.0, step=0.5, key='t_size', on_change=trigger_redesign)
 
-    with st.expander("4. Parametry Cięcia", expanded=False):
-        cut_angle = st.selectbox("Kierunek linii:", ["Prostopadle do drogi wewn.", "Prostopadle do drogi gminnej", "Równolegle do drogi gminnej"])
-        div_type = st.radio("Metoda:", ["Docelowa pow. (m²)", "Liczba równych działek"])
-        target_area = st.number_input("Docelowa pow.:", value=1000) if div_type == "Docelowa pow. (m²)" else 1000
-        exact_count = st.number_input("Liczba działek:", value=5, min_value=1) if div_type != "Docelowa pow. (m²)" else None
-        remainder_mode = st.selectbox("Resztówka:", ["Rozrzuć po równo na wszystkie", "Wydziel osobną resztówkę", "Dołącz do ostatniej działki"])
+    with st.expander("4. Parametry Cięcia", expanded=True):
+        st.selectbox("Kierunek linii:", ["Prostopadle do drogi wewn.", "Prostopadle do drogi gminnej", "Równolegle do drogi gminnej"], key='cut_angle', on_change=trigger_redesign)
+        st.radio("Metoda podziału:", ["Docelowa pow. (m²)", "Liczba równych działek"], key='div_type', on_change=trigger_redesign)
+        
+        if st.session_state.div_type == "Docelowa pow. (m²)":
+            st.number_input("Docelowa pow.:", min_value=1.0, step=50.0, key='target_area', on_change=trigger_redesign)
+            st.selectbox("Resztówka:", ["Wydziel osobną resztówkę", "Rozrzuć po równo na wszystkie", "Dołącz do ostatniej działki"], key='remainder_mode', on_change=trigger_redesign)
+        else:
+            st.number_input("Liczba działek:", min_value=1, step=1, key='exact_count', on_change=trigger_redesign)
 
-    if st.button("🚀 Wygeneruj Projekt Podziału", use_container_width=True, type="primary"):
-        run_design(road_width, road_pos, road_end, turnaround, t_size, last_area, cut_angle, target_area, exact_count, remainder_mode)
 
-    if st.session_state.sub_parcels:
-        st.markdown("### 📊 Raport Projektu")
+# --- ŚRODKOWA KOLUMNA: Mapa Folium ---
+with col_mid:
+    m = folium.Map(location=st.session_state.centroid_wgs84, zoom_start=st.session_state.zoom_start, tiles="CartoDB positron")
+    
+    if st.session_state.main_polygon:
+        epsg = st.session_state.get('epsg_code', 'EPSG:2178')
+        trans = Transformer.from_crs(epsg, "EPSG:4326", always_xy=True)
+        all_wgs_coords = []
+        
+        for idx, edge in enumerate(st.session_state.edges):
+            c_wgs = [trans.transform(x, y)[::-1] for x, y in edge.coords] 
+            all_wgs_coords.extend(c_wgs)
+            color, weight = '#333333', 3
+            if idx == st.session_state.public_road_idx: color, weight = 'red', 5
+            elif idx in st.session_state.inner_road_indices: color, weight = 'orange', 5
+            folium.PolyLine(locations=c_wgs, color=color, weight=weight, tooltip=f"Krawędź nr: {idx}").add_to(m)
+
+        if st.session_state.sub_parcels:
+            for i, p in enumerate(st.session_state.sub_parcels):
+                p_geoms = p.geoms if hasattr(p, 'geoms') else [p]
+                for g in p_geoms:
+                    if g.geom_type == 'Polygon':
+                        c_wgs = [trans.transform(x, y)[::-1] for x, y in g.exterior.coords]
+                        folium.Polygon(locations=c_wgs, color='blue', weight=2, fill=False).add_to(m)
+                        wgs_cent = trans.transform(g.centroid.x, g.centroid.y)[::-1]
+                        label_html = f"<div style='font-family: Arial; font-size: 11px; font-weight: bold; color: black; text-align: center; text-shadow: 1px 1px 2px white, -1px -1px 2px white, 1px -1px 2px white, -1px 1px 2px white;'>Dz. {i+1}<br>{p.area:.0f}</div>"
+                        folium.Marker(location=wgs_cent, icon=folium.DivIcon(html=label_html, icon_size=(100, 30), icon_anchor=(50, 15))).add_to(m)
+        
+        if st.session_state.road_polygon:
+            r_geoms = st.session_state.road_polygon.geoms if hasattr(st.session_state.road_polygon, 'geoms') else [st.session_state.road_polygon]
+            for g in r_geoms:
+                if g.geom_type == 'Polygon':
+                    c_wgs = [trans.transform(x, y)[::-1] for x, y in g.exterior.coords]
+                    folium.Polygon(locations=c_wgs, color='#ff8800', weight=2, fill=False).add_to(m)
+                    
+        if st.session_state.remainder_parcel:
+            rem_geoms = st.session_state.remainder_parcel.geoms if hasattr(st.session_state.remainder_parcel, 'geoms') else [st.session_state.remainder_parcel]
+            for g in rem_geoms:
+                if g.geom_type == 'Polygon':
+                    c_wgs = [trans.transform(x, y)[::-1] for x, y in g.exterior.coords]
+                    folium.Polygon(locations=c_wgs, color='red', weight=2, dash_array='5, 5', fill=False).add_to(m)
+                    wgs_cent = trans.transform(g.centroid.x, g.centroid.y)[::-1]
+                    label_html = f"<div style='font-family: Arial; font-size: 10px; font-weight: bold; color: red; text-align: center; text-shadow: 1px 1px 1px white;'>Reszta<br>{g.area:.0f}</div>"
+                    folium.Marker(location=wgs_cent, icon=folium.DivIcon(html=label_html, icon_size=(80, 30), icon_anchor=(40, 15))).add_to(m)
+            
+        if all_wgs_coords: m.fit_bounds(all_wgs_coords)
+
+    st_data = st_folium(m, width=700, height=800)
+    
+    if st_data['last_object_clicked_tooltip']:
+        try:
+            clicked_idx = int(st_data['last_object_clicked_tooltip'].replace("Krawędź nr: ", ""))
+            if st.session_state.picking_mode == 'public':
+                st.session_state.public_road_idx = clicked_idx
+                st.session_state.picking_mode = 'Oczekiwanie'
+                trigger_redesign()
+                st.rerun()
+            elif st.session_state.picking_mode == 'inner':
+                if clicked_idx in st.session_state.inner_road_indices:
+                    st.session_state.inner_road_indices.remove(clicked_idx)
+                else:
+                    st.session_state.inner_road_indices.append(clicked_idx)
+                trigger_redesign()
+                st.rerun()
+        except: pass
+
+
+# --- PRAWA KOLUMNA: Raport na Żywo ---
+with col_right:
+    st.markdown("### 📊 Raport Koncepcji")
+    
+    if st.session_state.main_polygon and st.session_state.sub_parcels:
+        # Płyta główna raportu
+        tot_area = st.session_state.main_polygon.area
+        road_area = st.session_state.road_polygon.area if st.session_state.road_polygon else 0
+        net_area = tot_area - road_area
+        
+        st.info(f"**Łączna pow. działek:** {tot_area:.0f} m²\n\n"
+                f"**Powierzchnia drogi:** {road_area:.0f} m²\n\n"
+                f"**Pow. na działki budowlane:** {net_area:.0f} m²")
+                
+        if st.session_state.remainder_parcel:
+            st.error(f"**Resztówka:** {st.session_state.remainder_parcel.area:.0f} m²")
+            
+        st.markdown("---")
+        st.markdown("#### Wykaz Działek:")
+        
         for i, p in enumerate(st.session_state.sub_parcels):
             mbr = p.minimum_rotated_rectangle
             c = list(mbr.exterior.coords)
             s1 = math.hypot(c[1][0]-c[0][0], c[1][1]-c[0][1])
             s2 = math.hypot(c[2][0]-c[1][0], c[2][1]-c[1][1])
             w, l = min(s1, s2), max(s1, s2)
-            st.markdown(f"**Dz. {i+1}** - Pow: **{p.area:.0f} m²** (Wymiar: ~{w:.1f} m x {l:.1f} m)")
-        
-        if st.session_state.remainder_parcel:
-            st.markdown(f"**Reszta:** {st.session_state.remainder_parcel.area:.0f} m²")
+            
+            with st.expander(f"Dz. {i+1} | {p.area:.0f} m²", expanded=False):
+                st.write(f"**Wymiary:** ~{w:.1f} m x {l:.1f} m")
+                st.write("**Skład ewidencji:**")
+                for orig in st.session_state.original_parcels:
+                    try:
+                        inter = p.intersection(orig['geom'])
+                        if inter.area > 1.0:
+                            st.caption(f"- z działki {orig['id'].split('.')[-1]}: {inter.area:.0f} m²")
+                    except: pass
 
+        st.markdown("---")
+        # Przycisk Eksportu DXF po prawej stronie
         try:
             doc = ezdxf.new('R2010')
             msp = doc.modelspace()
@@ -390,75 +485,8 @@ with col1:
 
             buffer = io.StringIO()
             doc.write(buffer)
-            st.download_button("💾 Pobierz DXF (EPSG:2000)", data=buffer.getvalue(), file_name="geo_podzial.dxf", mime="application/dxf")
-        except Exception as e: st.error(f"Błąd DXF: {e}")
-
-# --- MAPA FOLIUM (PRAWA STRONA) ---
-with col2:
-    m = folium.Map(location=st.session_state.centroid_wgs84, zoom_start=st.session_state.zoom_start, tiles="CartoDB positron")
-    
-    if st.session_state.main_polygon:
-        epsg = st.session_state.get('epsg_code', 'EPSG:2178')
-        trans = Transformer.from_crs(epsg, "EPSG:4326", always_xy=True)
-        all_wgs_coords = []
+            st.download_button("💾 Eksportuj do DXF", data=buffer.getvalue(), file_name="geo_podzial.dxf", mime="application/dxf", type="primary", use_container_width=True)
+        except Exception as e: st.error(f"Błąd przygotowania DXF: {e}")
         
-        for idx, edge in enumerate(st.session_state.edges):
-            c_wgs = [trans.transform(x, y)[::-1] for x, y in edge.coords] 
-            all_wgs_coords.extend(c_wgs)
-            
-            color, weight = '#333333', 3
-            if idx == st.session_state.public_road_idx: color, weight = 'red', 5
-            elif idx in st.session_state.inner_road_indices: color, weight = 'orange', 5
-            
-            folium.PolyLine(locations=c_wgs, color=color, weight=weight, tooltip=f"Krawędź nr: {idx}").add_to(m)
-
-        if st.session_state.sub_parcels:
-            for i, p in enumerate(st.session_state.sub_parcels):
-                p_geoms = p.geoms if hasattr(p, 'geoms') else [p]
-                for g in p_geoms:
-                    if g.geom_type == 'Polygon':
-                        c_wgs = [trans.transform(x, y)[::-1] for x, y in g.exterior.coords]
-                        folium.Polygon(locations=c_wgs, color='blue', weight=2, fill=False).add_to(m)
-                        
-                        wgs_cent = trans.transform(g.centroid.x, g.centroid.y)[::-1]
-                        label_html = f"""
-                        <div style='font-family: Arial, sans-serif; font-size: 11px; font-weight: bold; color: black; text-align: center; text-shadow: 1px 1px 2px white, -1px -1px 2px white, 1px -1px 2px white, -1px 1px 2px white;'>
-                            Dz. {i+1}<br>{p.area:.0f}
-                        </div>"""
-                        folium.Marker(location=wgs_cent, icon=folium.DivIcon(html=label_html, icon_size=(100, 30), icon_anchor=(50, 15))).add_to(m)
-        
-        if st.session_state.road_polygon:
-            r_geoms = st.session_state.road_polygon.geoms if hasattr(st.session_state.road_polygon, 'geoms') else [st.session_state.road_polygon]
-            for g in r_geoms:
-                if g.geom_type == 'Polygon':
-                    c_wgs = [trans.transform(x, y)[::-1] for x, y in g.exterior.coords]
-                    folium.Polygon(locations=c_wgs, color='#ff8800', weight=2, fill=False).add_to(m)
-                    
-        if st.session_state.remainder_parcel:
-            rem_geoms = st.session_state.remainder_parcel.geoms if hasattr(st.session_state.remainder_parcel, 'geoms') else [st.session_state.remainder_parcel]
-            for g in rem_geoms:
-                if g.geom_type == 'Polygon':
-                    c_wgs = [trans.transform(x, y)[::-1] for x, y in g.exterior.coords]
-                    folium.Polygon(locations=c_wgs, color='red', weight=2, dash_array='5, 5', fill=False).add_to(m)
-                    wgs_cent = trans.transform(g.centroid.x, g.centroid.y)[::-1]
-                    label_html = f"<div style='font-family: Arial; font-size: 10px; font-weight: bold; color: red; text-align: center; text-shadow: 1px 1px 1px white;'>Reszta<br>{g.area:.0f}</div>"
-                    folium.Marker(location=wgs_cent, icon=folium.DivIcon(html=label_html, icon_size=(80, 30), icon_anchor=(40, 15))).add_to(m)
-            
-        if all_wgs_coords: m.fit_bounds(all_wgs_coords)
-
-    st_data = st_folium(m, width=900, height=750)
-    
-    if st_data['last_object_clicked_tooltip']:
-        try:
-            clicked_idx = int(st_data['last_object_clicked_tooltip'].replace("Krawędź nr: ", ""))
-            if st.session_state.picking_mode == 'public':
-                st.session_state.public_road_idx = clicked_idx
-                st.session_state.picking_mode = 'Oczekiwanie'
-                st.rerun()
-            elif st.session_state.picking_mode == 'inner':
-                if clicked_idx in st.session_state.inner_road_indices:
-                    st.session_state.inner_road_indices.remove(clicked_idx)
-                else:
-                    st.session_state.inner_road_indices.append(clicked_idx)
-                st.rerun()
-        except: pass
+    else:
+        st.write("Wskaż krawędzie na mapie, by wygenerować raport.")
