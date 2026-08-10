@@ -21,12 +21,7 @@ if 'original_parcels' not in st.session_state:
         'public_road_idx': None, 'inner_road_indices': [],
         'sub_parcels': [], 'remainder_parcel': None, 'road_polygon': None,
         'cut_lines': [], 'centroid_wgs84': [52.0, 19.0], 'zoom_start': 6,
-        'picking_mode': 'Oczekiwanie', 'epsg_code': 'EPSG:2178',
-        # Dodajemy zmienne parametrów do śledzenia stanu UI "na żywo"
-        'road_width': 8.0, 'road_pos': "Przy krawędzi (Bok)", 'road_end': "Do samego końca działki",
-        'turnaround': False, 't_size': 12.5, 'last_area': 1500.0, 'cut_angle': "Prostopadle do drogi wewn.",
-        'div_type': "Docelowa pow. (m²)", 'target_area': 1000.0, 'exact_count': 5,
-        'remainder_mode': "Wydziel osobną resztówkę"
+        'picking_mode': 'Oczekiwanie', 'epsg_code': 'EPSG:2178'
     })
 
 # ==========================================
@@ -150,23 +145,30 @@ def fetch_data(ids_str):
     st.session_state.remainder_parcel = None
     st.session_state.picking_mode = 'Oczekiwanie'
     st.success(f"Pobrano {len(original_2000)} działek. Gotowe do wyboru krawędzi.")
-    
-    # Wymuszamy aktualizację UI po pobraniu nowych danych
-    trigger_redesign()
 
 # ==========================================
-# 3. GENEROWANIE KONCEPCJI (LIVE)
+# 3. GENEROWANIE KONCEPCJI (NA ŻĄDANIE)
 # ==========================================
-def trigger_redesign():
-    """Funkcja wywoływana przy KAŻDEJ zmianie na suwaku lub liście rozwijanej."""
+def run_design():
     if not st.session_state.main_polygon or st.session_state.public_road_idx is None or not st.session_state.inner_road_indices:
-        return # Nic nie robimy, dopóki nie ma wskazanych krawędzi
+        st.warning("Przed przeliczeniem wskaż na mapie Drogę Gminną (czerwona) i Wewnętrzną (pomarańczowa).")
+        return
+
+    # Pobieranie parametrów z bezpieczeństwem braku wartości (get)
+    rw = st.session_state.get('road_width', 8.0)
+    is_middle = st.session_state.get('road_pos', "Przy krawędzi (Bok)") == "Środek Działki"
+    stop_at_last = st.session_state.get('road_end', "Do samego końca działki") == "Zatrzymaj przed ostatnią działką"
+    last_area = st.session_state.get('last_area', 1500.0)
+    turnaround = st.session_state.get('turnaround', False)
+    t_size = st.session_state.get('t_size', 12.5)
+    cut_angle = st.session_state.get('cut_angle', "Prostopadle do drogi wewn.")
+    div_type = st.session_state.get('div_type', "Docelowa pow. (m²)")
+    target_area = st.session_state.get('target_area', 1000.0)
+    exact_count = st.session_state.get('exact_count', 5) if div_type != "Docelowa pow. (m²)" else None
+    rem_mode = st.session_state.get('remainder_mode', "Wydziel osobną resztówkę")
 
     main_poly = st.session_state.main_polygon
     edges = st.session_state.edges
-    rw = st.session_state.road_width
-    is_middle = st.session_state.road_pos == "Środek Działki"
-    stop_at_last = st.session_state.road_end == "Zatrzymaj przed ostatnią działką"
     
     st.session_state.sub_parcels, st.session_state.remainder_parcel, st.session_state.cut_lines = [], None, []
 
@@ -198,7 +200,6 @@ def trigger_redesign():
     pdx, pdy = px2[0]-px1[0], px2[1]-px1[1]
     plen = math.hypot(pdx, pdy)
     
-    cut_angle = st.session_state.cut_angle
     if cut_angle == "Prostopadle do drogi wewn.": v_cut = (nx, ny)
     elif cut_angle == "Prostopadle do drogi gminnej": v_cut = (-pdy/plen, pdx/plen)
     else: v_cut = (pdx/plen, pdy/plen)
@@ -209,13 +210,12 @@ def trigger_redesign():
 
     back_parcel, working_polygon = None, main_poly
     if stop_at_last:
-        last_a = st.session_state.last_area
-        back_parcel, working_polygon, _ = _cut_parcel(main_poly, v_cut, v_sweep, last_a, cut_from_back=True)
+        back_parcel, working_polygon, _ = _cut_parcel(main_poly, v_cut, v_sweep, last_area, cut_from_back=True)
         if back_parcel is None: working_polygon = main_poly
 
     road_poly = full_road_base.intersection(working_polygon)
 
-    if st.session_state.turnaround and road_poly.geom_type == 'Polygon':
+    if turnaround and road_poly.geom_type == 'Polygon':
         try:
             if is_middle: c_line = road_centerline
             else: c_line = affinity.translate(ext_path, xoff=nx*(rw/2), yoff=ny*(rw/2))
@@ -236,7 +236,6 @@ def trigger_redesign():
                 lnx, lny = -ry, rx
                 if lnx*nx + lny*ny < 0: lnx, lny = -lnx, -lny
                 
-                t_size = st.session_state.t_size
                 if is_middle:
                     C1, C2 = (end_pt[0] + lnx*(t_size/2), end_pt[1] + lny*(t_size/2)), (end_pt[0] - lnx*(t_size/2), end_pt[1] - lny*(t_size/2))
                 else:
@@ -256,11 +255,6 @@ def trigger_redesign():
 
     geoms = [net_poly] if net_poly.geom_type == 'Polygon' else net_poly.geoms
     
-    div_type = st.session_state.div_type
-    target_area = st.session_state.target_area if div_type == "Docelowa pow. (m²)" else 1000.0
-    exact_count = st.session_state.exact_count if div_type != "Docelowa pow. (m²)" else None
-    rem_mode = st.session_state.remainder_mode
-
     for geom in geoms:
         rem_poly = geom
         cuts_needed = exact_count - 1 if exact_count else 999
@@ -298,16 +292,23 @@ def trigger_redesign():
 
     if back_parcel: st.session_state.sub_parcels.append(back_parcel)
 
+
 # ==========================================
 # 4. INTERFEJS STREAMLIT (UI)
 # ==========================================
-st.title("🗺️ AI GeoSplitter - Generative Design (Real-Time)")
+st.title("🗺️ AI GeoSplitter - Generative Design")
 
 # === PODZIAŁ NA 3 KOLUMNY ===
 col_left, col_mid, col_right = st.columns([1.2, 2.5, 1.2])
 
-# --- LEWA KOLUMNA: Ustawienia (Z triggerami na żywo) ---
+# --- LEWA KOLUMNA: Ustawienia (Brak wywołań 'on_change') ---
 with col_left:
+    # GŁÓWNY PRZYCISK NA SAMEJ GÓRZE
+    if st.button("🚀 Przelicz Projekt", type="primary", use_container_width=True):
+        run_design()
+
+    st.markdown("<br>", unsafe_allow_html=True) # Odstęp
+
     with st.expander("1. GUGiK Data (EPSG:2000)", expanded=True):
         ids_input = st.text_input("ID Działki (TERYT):", "143411_4.0001.172")
         if st.button("Pobierz Geometrię"): fetch_data(ids_input)
@@ -318,30 +319,29 @@ with col_left:
             if st.button("🔴 Gminna (1x)"): st.session_state.picking_mode = 'public'
         with c_m2:
             if st.button("🟠 Wewn. (Wiele)"): st.session_state.picking_mode = 'inner'
-        st.markdown(f"Tryb: **{st.session_state.picking_mode}**")
+        st.markdown(f"Tryb wyboru: **{st.session_state.picking_mode}**")
             
-    with st.expander("3. Droga Wewnętrzna", expanded=True):
-        st.slider("Szerokość drogi (m):", 5.0, 15.0, key='road_width', on_change=trigger_redesign)
-        st.selectbox("Pozycja:", ["Przy krawędzi (Bok)", "Środek Działki"], key='road_pos', on_change=trigger_redesign)
-        st.selectbox("Zakończenie:", ["Do samego końca działki", "Zatrzymaj przed ostatnią działką"], key='road_end', on_change=trigger_redesign)
+    with st.expander("3. Architektura Drogi", expanded=True):
+        st.slider("Szerokość drogi (m):", 5.0, 15.0, 8.0, key='road_width')
+        st.selectbox("Pozycja:", ["Przy krawędzi (Bok)", "Środek Działki"], key='road_pos')
+        road_end = st.selectbox("Zakończenie:", ["Do samego końca działki", "Zatrzymaj przed ostatnią działką"], key='road_end')
         
-        # Pokaż głębokość tylko jeśli wybrano "Zatrzymaj przed ostatnią"
-        if st.session_state.road_end == "Zatrzymaj przed ostatnią działką":
-            st.number_input("Pow. ost. działki (m²):", min_value=1.0, step=50.0, key='last_area', on_change=trigger_redesign)
+        if road_end == "Zatrzymaj przed ostatnią działką":
+            st.number_input("Pow. ost. działki (m²):", min_value=1.0, step=50.0, value=1500.0, key='last_area')
             
-        st.checkbox("Dodaj plac do zawracania", key='turnaround', on_change=trigger_redesign)
-        if st.session_state.turnaround:
-            st.number_input("Wymiar placu (m):", min_value=1.0, step=0.5, key='t_size', on_change=trigger_redesign)
+        turnaround = st.checkbox("Dodaj plac do zawracania", key='turnaround')
+        if turnaround:
+            st.number_input("Wymiar placu (m):", min_value=1.0, step=0.5, value=12.5, key='t_size')
 
     with st.expander("4. Parametry Cięcia", expanded=True):
-        st.selectbox("Kierunek linii:", ["Prostopadle do drogi wewn.", "Prostopadle do drogi gminnej", "Równolegle do drogi gminnej"], key='cut_angle', on_change=trigger_redesign)
-        st.radio("Metoda podziału:", ["Docelowa pow. (m²)", "Liczba równych działek"], key='div_type', on_change=trigger_redesign)
+        st.selectbox("Kierunek linii:", ["Prostopadle do drogi wewn.", "Prostopadle do drogi gminnej", "Równolegle do drogi gminnej"], key='cut_angle')
+        div_type = st.radio("Metoda podziału:", ["Docelowa pow. (m²)", "Liczba równych działek"], key='div_type')
         
-        if st.session_state.div_type == "Docelowa pow. (m²)":
-            st.number_input("Docelowa pow.:", min_value=1.0, step=50.0, key='target_area', on_change=trigger_redesign)
-            st.selectbox("Resztówka:", ["Wydziel osobną resztówkę", "Rozrzuć po równo na wszystkie", "Dołącz do ostatniej działki"], key='remainder_mode', on_change=trigger_redesign)
+        if div_type == "Docelowa pow. (m²)":
+            st.number_input("Docelowa pow.:", min_value=1.0, step=50.0, value=1000.0, key='target_area')
+            st.selectbox("Resztówka:", ["Wydziel osobną resztówkę", "Rozrzuć po równo na wszystkie", "Dołącz do ostatniej działki"], key='remainder_mode')
         else:
-            st.number_input("Liczba działek:", min_value=1, step=1, key='exact_count', on_change=trigger_redesign)
+            st.number_input("Liczba działek:", min_value=1, step=1, value=5, key='exact_count')
 
 
 # --- ŚRODKOWA KOLUMNA: Mapa Folium ---
@@ -393,30 +393,28 @@ with col_mid:
 
     st_data = st_folium(m, width=700, height=800)
     
+    # Przechwytywanie kliknięć na krawędzie
     if st_data['last_object_clicked_tooltip']:
         try:
             clicked_idx = int(st_data['last_object_clicked_tooltip'].replace("Krawędź nr: ", ""))
             if st.session_state.picking_mode == 'public':
                 st.session_state.public_road_idx = clicked_idx
                 st.session_state.picking_mode = 'Oczekiwanie'
-                trigger_redesign()
                 st.rerun()
             elif st.session_state.picking_mode == 'inner':
                 if clicked_idx in st.session_state.inner_road_indices:
                     st.session_state.inner_road_indices.remove(clicked_idx)
                 else:
                     st.session_state.inner_road_indices.append(clicked_idx)
-                trigger_redesign()
                 st.rerun()
         except: pass
 
 
-# --- PRAWA KOLUMNA: Raport na Żywo ---
+# --- PRAWA KOLUMNA: Raport ---
 with col_right:
     st.markdown("### 📊 Raport Koncepcji")
     
     if st.session_state.main_polygon and st.session_state.sub_parcels:
-        # Płyta główna raportu
         tot_area = st.session_state.main_polygon.area
         road_area = st.session_state.road_polygon.area if st.session_state.road_polygon else 0
         net_area = tot_area - road_area
@@ -449,7 +447,7 @@ with col_right:
                     except: pass
 
         st.markdown("---")
-        # Przycisk Eksportu DXF po prawej stronie
+        # Przycisk Eksportu DXF
         try:
             doc = ezdxf.new('R2010')
             msp = doc.modelspace()
@@ -489,4 +487,4 @@ with col_right:
         except Exception as e: st.error(f"Błąd przygotowania DXF: {e}")
         
     else:
-        st.write("Wskaż krawędzie na mapie, by wygenerować raport.")
+        st.write("Wskaż krawędzie i kliknij 'Przelicz Projekt' po lewej stronie.")
