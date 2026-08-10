@@ -21,7 +21,7 @@ if 'original_parcels' not in st.session_state:
         'public_road_idx': None, 'inner_road_idx': None,
         'sub_parcels': [], 'remainder_parcel': None, 'road_polygon': None,
         'cut_lines': [], 'centroid_wgs84': [52.0, 19.0], 'zoom_start': 6,
-        'picking_mode': 'Oczekiwanie'
+        'picking_mode': 'Oczekiwanie', 'epsg_code': 'EPSG:2178'
     })
 
 # ==========================================
@@ -97,7 +97,7 @@ def fetch_data(ids_str):
         except: pass
 
     if not raw_polygons:
-        st.error("Nie znaleziono działek. Sprawdź TERYT.")
+        st.error("Nie znaleziono działek. Sprawdź numery TERYT.")
         return
 
     # EPSG:2180 to EPSG:2000 & WGS84
@@ -108,7 +108,10 @@ def fetch_data(ids_str):
     st.session_state.centroid_wgs84 = [lat, lon]
     st.session_state.zoom_start = 18
     
+    # Detekcja właściwej strefy układu 2000
     epsg_2000 = "EPSG:2176" if lon < 16.5 else "EPSG:2177" if lon < 19.5 else "EPSG:2178" if lon < 22.5 else "EPSG:2179"
+    st.session_state.epsg_code = epsg_2000 # Zapisujemy poprawny EPSG!
+    
     trans_to_2000 = Transformer.from_crs("EPSG:2180", epsg_2000, always_xy=True)
 
     original_2000 = []
@@ -131,15 +134,17 @@ def fetch_data(ids_str):
     st.session_state.public_road_idx = None
     st.session_state.inner_road_idx = None
     st.session_state.sub_parcels = []
+    st.session_state.road_polygon = None
+    st.session_state.remainder_parcel = None
     st.session_state.picking_mode = 'Oczekiwanie'
-    st.success(f"Pobrano {len(original_2000)} działek. Gotowe do wyboru krawędzi.")
+    st.success(f"Pobrano {len(original_2000)} działek. Układ: {epsg_2000}. Gotowe do wyboru krawędzi na mapie obok!")
 
 # ==========================================
 # 3. GENEROWANIE KONCEPCJI
 # ==========================================
 def run_design(road_width, road_pos, road_end, turnaround, t_size, last_area, cut_angle, target_area, exact_count, remainder_mode):
     if not st.session_state.main_polygon or st.session_state.public_road_idx is None or st.session_state.inner_road_idx is None:
-        st.warning("Najpierw wskaż na mapie Drogę Gminną (kliknij '1') i Wewnętrzną (kliknij '2').")
+        st.warning("Najpierw wskaż na mapie Drogę Gminną (kliknij czerwoną opcję) i Wewnętrzną (pomarańczową opcję).")
         return
 
     main_poly = st.session_state.main_polygon
@@ -271,26 +276,22 @@ def run_design(road_width, road_pos, road_end, turnaround, t_size, last_area, cu
 # ==========================================
 st.title("🗺️ AI GeoSplitter - Generative Design")
 
-# PANEL GŁÓWNY (Lewa: Ustawienia, Prawa: Mapa)
 col1, col2 = st.columns([1, 2])
 
 with col1:
     with st.expander("1. GUGiK Data (EPSG:2000)", expanded=True):
-        ids_input = st.text_input("ID Działki (TERYT):", "143411_4.0001.172")
+        ids_input = st.text_input("ID Działki (TERYT):", "261104_2.0007.421,261104_2.0007.422")
         if st.button("Pobierz Geometrię"): fetch_data(ids_input)
 
     with st.expander("2. Interaktywny Kontekst z Mapy", expanded=True):
-        st.write("Wybierz na mapie numery linii dla odniesienia:")
+        st.write("Kliknij najpierw przycisk tutaj, a potem linię na mapie:")
         c_mode1, c_mode2 = st.columns(2)
         with c_mode1:
             if st.button("🔴 Wybierz Gminną"): st.session_state.picking_mode = 'public'
         with c_mode2:
             if st.button("🟠 Wybierz Wewnętrzną"): st.session_state.picking_mode = 'inner'
             
-        st.info(f"Obecnie klikasz na mapie by przypisać: **{st.session_state.picking_mode}**")
-        if st.button("Przelicz i Rysuj Podział", type="primary"):
-            # Parametry pobrane z UI
-            pass # Wykonanie poniżej w bloku UI
+        st.info(f"Oczekujący tryb klikania mapy: **{st.session_state.picking_mode}**")
             
     with st.expander("3. Architektura Drogi", expanded=False):
         road_width = st.slider("Szerokość drogi (m):", 5.0, 15.0, 8.0)
@@ -310,7 +311,6 @@ with col1:
     if st.button("🚀 Wygeneruj Projekt Podziału", use_container_width=True, type="primary"):
         run_design(road_width, road_pos, road_end, turnaround, t_size, last_area, cut_angle, target_area, exact_count, remainder_mode)
 
-    # EKSPORT DXF (Przycisk pobierania Streamlit)
     if st.session_state.sub_parcels:
         try:
             doc = ezdxf.new('R2010')
@@ -340,42 +340,47 @@ with col1:
 
             buffer = io.StringIO()
             doc.write(buffer)
-            st.download_button("💾 Pobierz DXF (EPSG:2000)", data=buffer.getvalue(), file_name="geo_podzial.dxf", mime="application/dxf")
+            st.download_button("💾 Pobierz plik DXF", data=buffer.getvalue(), file_name="geo_podzial.dxf", mime="application/dxf")
         except Exception as e: st.error(f"Błąd DXF: {e}")
 
 # --- MAPA FOLIUM (PRAWA STRONA) ---
 with col2:
     m = folium.Map(location=st.session_state.centroid_wgs84, zoom_start=st.session_state.zoom_start, tiles="CartoDB positron")
     
-    # Rysowanie bazowej działki jako obrysu
     if st.session_state.main_polygon:
-        trans_to_wgs = Transformer.from_crs("EPSG:2000", "EPSG:4326", always_xy=True)
-        # Hack by wykryć z której strefy jesteśmy (uproszczony dla wizu)
-        epsg_detect = "EPSG:2177" # Można dynamicznie poprawić
-        trans = Transformer.from_crs(epsg_detect, "EPSG:4326", always_xy=True)
+        # Odczytujemy właściwy kod EPSG zapisany w fetch_data
+        epsg = st.session_state.get('epsg_code', 'EPSG:2178')
+        trans = Transformer.from_crs(epsg, "EPSG:4326", always_xy=True)
         
-        # Aby ułatwić klikanie w sieci - każda linia granicy jest osobną, grubą, klikalną linią w Folium z tooltipem!
+        all_wgs_coords = []
+        
+        # Rysowanie krawędzi do wyboru (Klikalne)
         for idx, edge in enumerate(st.session_state.edges):
-            c_wgs = [trans.transform(x, y)[::-1] for x, y in edge.coords] # Folium to [lat, lon]
+            c_wgs = [trans.transform(x, y)[::-1] for x, y in edge.coords] # [lat, lon]
+            all_wgs_coords.extend(c_wgs)
             
             color = 'black'
             if idx == st.session_state.public_road_idx: color = 'red'
             elif idx == st.session_state.inner_road_idx: color = 'orange'
             
-            folium.PolyLine(locations=c_wgs, color=color, weight=6, tooltip=f"Krawędź nr: {idx}").add_to(m)
+            folium.PolyLine(locations=c_wgs, color=color, weight=8, tooltip=f"Krawędź nr: {idx}").add_to(m)
 
-        # Rysowanie zaprojektowanych działek (Przybliżona konwersja do WGS dla wizu)
+        # Rysowanie zaprojektowanych działek po przeliczeniu
         if st.session_state.sub_parcels:
             for i, p in enumerate(st.session_state.sub_parcels):
                 c_wgs = [trans.transform(x, y)[::-1] for x, y in p.exterior.coords]
-                folium.Polygon(locations=c_wgs, color='blue', fill=True, fill_opacity=0.3, tooltip=f"Dz. {i+1} ({p.area:.0f}m2)").add_to(m)
+                folium.Polygon(locations=c_wgs, color='blue', fill=True, fill_opacity=0.3, tooltip=f"Dz. {i+1} ({p.area:.0f}m²)").add_to(m)
         if st.session_state.road_polygon:
             c_wgs = [trans.transform(x, y)[::-1] for x, y in st.session_state.road_polygon.exterior.coords]
             folium.Polygon(locations=c_wgs, color='yellow', fill=True, fill_opacity=0.6).add_to(m)
+            
+        # Zmuszenie mapy by wykadrowała się do granic działki
+        if all_wgs_coords:
+            m.fit_bounds(all_wgs_coords)
 
-    st_data = st_folium(m, width=900, height=700)
+    st_data = st_folium(m, width=900, height=750)
     
-    # Obsługa kliknięć "z mapy" (Folium zwraca nam tekst z Tooltipa klikniętego obiektu!)
+    # Przechwytywanie kliknięć
     if st_data['last_object_clicked_tooltip']:
         try:
             clicked_idx = int(st_data['last_object_clicked_tooltip'].replace("Krawędź nr: ", ""))
