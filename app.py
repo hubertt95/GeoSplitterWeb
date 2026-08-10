@@ -21,7 +21,7 @@ if 'original_parcels' not in st.session_state:
         'public_road_idx': None, 'inner_road_indices': [],
         'sub_parcels': [], 'remainder_parcel': None, 'road_polygon': None,
         'cut_lines': [], 'centroid_wgs84': [52.0, 19.0], 'zoom_start': 6,
-        'picking_mode': 'Oczekiwanie', 'epsg_code': 'EPSG:2178'
+        'epsg_code': 'EPSG:2178'
     })
 
 # ==========================================
@@ -143,18 +143,16 @@ def fetch_data(ids_str):
     st.session_state.sub_parcels = []
     st.session_state.road_polygon = None
     st.session_state.remainder_parcel = None
-    st.session_state.picking_mode = 'Oczekiwanie'
-    st.success(f"Pobrano {len(original_2000)} działek. Gotowe do wyboru krawędzi.")
+    st.success(f"Pobrano {len(original_2000)} działek. Użyj panelu po lewej by zdefiniować drogi.")
 
 # ==========================================
-# 3. GENEROWANIE KONCEPCJI (NA ŻĄDANIE)
+# 3. GENEROWANIE KONCEPCJI
 # ==========================================
 def run_design():
     if not st.session_state.main_polygon or st.session_state.public_road_idx is None or not st.session_state.inner_road_indices:
-        st.warning("Przed przeliczeniem wskaż na mapie Drogę Gminną (czerwona) i Wewnętrzną (pomarańczowa).")
+        st.warning("Przed przeliczeniem wskaż w panelu Drogę Gminną oraz Wewnętrzną.")
         return
 
-    # Pobieranie parametrów z bezpieczeństwem braku wartości (get)
     rw = st.session_state.get('road_width', 8.0)
     is_middle = st.session_state.get('road_pos', "Przy krawędzi (Bok)") == "Środek Działki"
     stop_at_last = st.session_state.get('road_end', "Do samego końca działki") == "Zatrzymaj przed ostatnią działką"
@@ -301,34 +299,52 @@ st.title("🗺️ AI GeoSplitter - Generative Design")
 # === PODZIAŁ NA 3 KOLUMNY ===
 col_left, col_mid, col_right = st.columns([1.2, 2.5, 1.2])
 
-# --- LEWA KOLUMNA: Ustawienia (Brak wywołań 'on_change') ---
+# --- LEWA KOLUMNA: Ustawienia ---
 with col_left:
-    # GŁÓWNY PRZYCISK NA SAMEJ GÓRZE
     if st.button("🚀 Przelicz Projekt", type="primary", use_container_width=True):
         run_design()
 
-    st.markdown("<br>", unsafe_allow_html=True) # Odstęp
+    st.markdown("<br>", unsafe_allow_html=True)
 
     with st.expander("1. GUGiK Data (EPSG:2000)", expanded=True):
         ids_input = st.text_input("ID Działki (TERYT):", "143411_4.0001.172")
         if st.button("Pobierz Geometrię"): fetch_data(ids_input)
 
-    with st.expander("2. Krawędzie (Map Picking)", expanded=True):
-        c_m1, c_m2 = st.columns(2)
-        with c_m1:
-            if st.button("🔴 Gminna (1x)"): st.session_state.picking_mode = 'public'
-        with c_m2:
-            if st.button("🟠 Wewn. (Wiele)"): st.session_state.picking_mode = 'inner'
-        st.markdown(f"Tryb wyboru: **{st.session_state.picking_mode}**")
+    with st.expander("2. Krawędzie (Wybór z listy)", expanded=True):
+        if not st.session_state.edges:
+            st.info("Pobierz najpierw geometrię, aby wygenerować numery krawędzi na mapie.")
+        else:
+            edge_opts = list(range(len(st.session_state.edges)))
+            
+            # Bezpieczne aktualizowanie stanu dropdownów
+            if st.session_state.public_road_idx not in edge_opts:
+                st.session_state.public_road_idx = None
+            st.session_state.inner_road_indices = [x for x in st.session_state.inner_road_indices if x in edge_opts]
+            
+            pub_idx = st.selectbox(
+                "🔴 Wybierz Drogę Gminną (1 krawędź):", 
+                options=[None] + edge_opts, 
+                format_func=lambda x: "Brak" if x is None else f"Krawędź nr {x}",
+                index=0 if st.session_state.public_road_idx is None else edge_opts.index(st.session_state.public_road_idx) + 1
+            )
+            
+            inn_idx = st.multiselect(
+                "🟠 Wybierz Drogę Wewn. (Wiele krawędzi):", 
+                options=edge_opts, 
+                default=st.session_state.inner_road_indices,
+                format_func=lambda x: f"Krawędź nr {x}"
+            )
+            
+            # Zapisz wybrane numery do pamięci
+            st.session_state.public_road_idx = pub_idx
+            st.session_state.inner_road_indices = inn_idx
             
     with st.expander("3. Architektura Drogi", expanded=True):
         st.slider("Szerokość drogi (m):", 5.0, 15.0, 8.0, key='road_width')
         st.selectbox("Pozycja:", ["Przy krawędzi (Bok)", "Środek Działki"], key='road_pos')
         road_end = st.selectbox("Zakończenie:", ["Do samego końca działki", "Zatrzymaj przed ostatnią działką"], key='road_end')
-        
         if road_end == "Zatrzymaj przed ostatnią działką":
             st.number_input("Pow. ost. działki (m²):", min_value=1.0, step=50.0, value=1500.0, key='last_area')
-            
         turnaround = st.checkbox("Dodaj plac do zawracania", key='turnaround')
         if turnaround:
             st.number_input("Wymiar placu (m):", min_value=1.0, step=0.5, value=12.5, key='t_size')
@@ -336,7 +352,6 @@ with col_left:
     with st.expander("4. Parametry Cięcia", expanded=True):
         st.selectbox("Kierunek linii:", ["Prostopadle do drogi wewn.", "Prostopadle do drogi gminnej", "Równolegle do drogi gminnej"], key='cut_angle')
         div_type = st.radio("Metoda podziału:", ["Docelowa pow. (m²)", "Liczba równych działek"], key='div_type')
-        
         if div_type == "Docelowa pow. (m²)":
             st.number_input("Docelowa pow.:", min_value=1.0, step=50.0, value=1000.0, key='target_area')
             st.selectbox("Resztówka:", ["Wydziel osobną resztówkę", "Rozrzuć po równo na wszystkie", "Dołącz do ostatniej działki"], key='remainder_mode')
@@ -353,14 +368,22 @@ with col_mid:
         trans = Transformer.from_crs(epsg, "EPSG:4326", always_xy=True)
         all_wgs_coords = []
         
+        # 1. RYSOWANIE KRAWĘDZI I ICH NUMERÓW (PINY)
         for idx, edge in enumerate(st.session_state.edges):
             c_wgs = [trans.transform(x, y)[::-1] for x, y in edge.coords] 
             all_wgs_coords.extend(c_wgs)
-            color, weight = '#333333', 3
+            color, weight = '#777777', 3
             if idx == st.session_state.public_road_idx: color, weight = 'red', 5
             elif idx in st.session_state.inner_road_indices: color, weight = 'orange', 5
-            folium.PolyLine(locations=c_wgs, color=color, weight=weight, tooltip=f"Krawędź nr: {idx}").add_to(m)
+            folium.PolyLine(locations=c_wgs, color=color, weight=weight).add_to(m)
+            
+            # Etykieta numeru na środku każdej krawędzi
+            mid_pt = edge.interpolate(0.5, normalized=True)
+            mid_wgs = trans.transform(mid_pt.x, mid_pt.y)[::-1]
+            label_html = f"<div style='font-family: Arial; font-size: 11px; font-weight: bold; color: white; background-color: {color}; border: 1px solid white; border-radius: 12px; width: 24px; height: 24px; text-align: center; line-height: 22px; box-shadow: 2px 2px 3px rgba(0,0,0,0.4);'>{idx}</div>"
+            folium.Marker(location=mid_wgs, icon=folium.DivIcon(html=label_html, icon_size=(24, 24), icon_anchor=(12, 12))).add_to(m)
 
+        # 2. RYSOWANIE WYNIKÓW PODZIAŁU
         if st.session_state.sub_parcels:
             for i, p in enumerate(st.session_state.sub_parcels):
                 p_geoms = p.geoms if hasattr(p, 'geoms') else [p]
@@ -391,23 +414,8 @@ with col_mid:
             
         if all_wgs_coords: m.fit_bounds(all_wgs_coords)
 
-    st_data = st_folium(m, width=700, height=800)
-    
-    # Przechwytywanie kliknięć na krawędzie
-    if st_data['last_object_clicked_tooltip']:
-        try:
-            clicked_idx = int(st_data['last_object_clicked_tooltip'].replace("Krawędź nr: ", ""))
-            if st.session_state.picking_mode == 'public':
-                st.session_state.public_road_idx = clicked_idx
-                st.session_state.picking_mode = 'Oczekiwanie'
-                st.rerun()
-            elif st.session_state.picking_mode == 'inner':
-                if clicked_idx in st.session_state.inner_road_indices:
-                    st.session_state.inner_road_indices.remove(clicked_idx)
-                else:
-                    st.session_state.inner_road_indices.append(clicked_idx)
-                st.rerun()
-        except: pass
+    # Renderujemy mapę bez przechwytywania eventów kliknięcia (szybciej działa)
+    st_folium(m, width=700, height=800, returned_objects=[])
 
 
 # --- PRAWA KOLUMNA: Raport ---
@@ -447,7 +455,7 @@ with col_right:
                     except: pass
 
         st.markdown("---")
-        # Przycisk Eksportu DXF
+        # Przycisk Eksportu DXF po prawej stronie
         try:
             doc = ezdxf.new('R2010')
             msp = doc.modelspace()
@@ -487,4 +495,4 @@ with col_right:
         except Exception as e: st.error(f"Błąd przygotowania DXF: {e}")
         
     else:
-        st.write("Wskaż krawędzie i kliknij 'Przelicz Projekt' po lewej stronie.")
+        st.write("Wskaż krawędzie w panelu po lewej, by wygenerować raport.")
