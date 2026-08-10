@@ -18,7 +18,7 @@ st.set_page_config(layout="wide", page_title="AI GeoSplitter Web", page_icon="�
 if 'original_parcels' not in st.session_state:
     st.session_state.update({
         'original_parcels': [], 'main_polygon': None, 'edges': [],
-        'public_road_idx': None, 'inner_road_indices': [], # LISTA DO WIELU KRAWĘDZI
+        'public_road_idx': None, 'inner_road_indices': [],
         'sub_parcels': [], 'remainder_parcel': None, 'road_polygon': None,
         'cut_lines': [], 'centroid_wgs84': [52.0, 19.0], 'zoom_start': 6,
         'picking_mode': 'Oczekiwanie', 'epsg_code': 'EPSG:2178'
@@ -27,15 +27,28 @@ if 'original_parcels' not in st.session_state:
 # ==========================================
 # 1. FUNKCJE POMOCNICZE I MATEMATYCZNE
 # ==========================================
-def _extend_line(line, dist=2000):
+def _extend_polyline(line, dist=2000):
+    """HYBRYDA: Rozciąga pierwszy i ostatni segment polilinii w nieskończoność, 
+    zachowując wszystkie punkty zagięcia w środku."""
+    if line.geom_type == 'MultiLineString':
+        try: line = shapely.ops.linemerge(line)
+        except: line = line.geoms[0]
+        
     c = list(line.coords)
+    if len(c) < 2: return line
+    
+    # Wydłużenie pierwszego segmentu w tył
     dx1, dy1 = c[0][0]-c[1][0], c[0][1]-c[1][1]
     l1 = math.hypot(dx1, dy1)
     p_start = (c[0][0] + dx1/l1*dist, c[0][1] + dy1/l1*dist) if l1 else c[0]
+    
+    # Wydłużenie ostatniego segmentu w przód
     dx2, dy2 = c[-1][0]-c[-2][0], c[-1][1]-c[-2][1]
     l2 = math.hypot(dx2, dy2)
     p_end = (c[-1][0] + dx2/l2*dist, c[-1][1] + dy2/l2*dist) if l2 else c[-1]
-    return LineString([p_start] + c + [p_end])
+    
+    # Złożenie nowej polilinii ze starym środkiem
+    return LineString([p_start] + c[1:-1] + [p_end])
 
 def _cut_parcel(poly, v_cut, v_sweep, target_area, cut_from_back=False):
     cx, cy, sx, sy = v_cut[0], v_cut[1], v_sweep[0], v_sweep[1]
@@ -146,7 +159,7 @@ def fetch_data(ids_str):
     st.success(f"Pobrano {len(original_2000)} działek. Układ: {epsg_2000}. Gotowe do wyboru krawędzi.")
 
 # ==========================================
-# 3. GENEROWANIE KONCEPCJI
+# 3. GENEROWANIE KONCEPCJI (Z HYBRYDĄ)
 # ==========================================
 def run_design(road_width, road_pos, road_end, turnaround, t_size, last_area, cut_angle, target_area, exact_count, remainder_mode):
     if not st.session_state.main_polygon or st.session_state.public_road_idx is None or not st.session_state.inner_road_indices:
@@ -161,35 +174,33 @@ def run_design(road_width, road_pos, road_end, turnaround, t_size, last_area, cu
     
     st.session_state.sub_parcels, st.session_state.remainder_parcel, st.session_state.cut_lines = [], None, []
 
-    # Integracja wielu krawędzi wewnętrznych
     inner_lines = [edges[i] for i in sorted(st.session_state.inner_road_indices)]
     inner_path = unary_union(inner_lines)
     if inner_path.geom_type == 'MultiLineString':
         try: inner_path = shapely.ops.linemerge(inner_path)
         except: inner_path = inner_lines[0]
-
-    ext_path = _extend_line(inner_path, 2000)
-    c = list(ext_path.coords)
-    dx, dy = c[-1][0]-c[0][0], c[-1][1]-c[0][1]
-    l_len = math.hypot(dx, dy)
-    nx, ny = -dy/l_len, dx/l_len 
+        
+    # Używamy HYBRYDOWEGO rozszerzania wielokątów by zachować wszystkie krzywizny
+    ext_path = _extend_polyline(inner_path, 2000)
     
-    cx, cy = main_poly.centroid.x - c[0][0], main_poly.centroid.y - c[0][1]
+    c_overall = list(ext_path.coords)
+    dx_ov, dy_ov = c_overall[-1][0]-c_overall[0][0], c_overall[-1][1]-c_overall[0][1]
+    l_len = math.hypot(dx_ov, dy_ov)
+    nx, ny = -dy_ov/l_len, dx_ov/l_len 
+    
+    cx, cy = main_poly.centroid.x - c_overall[0][0], main_poly.centroid.y - c_overall[0][1]
     if cx*nx + cy*ny < 0: nx, ny = -nx, -ny
 
+    # HYBRYDA TWORZENIA DROGI
     if is_middle:
-        projections = [(pt[0]-c[0][0])*nx + (pt[1]-c[0][1])*ny for pt in main_poly.exterior.coords]
+        projections = [(pt[0]-c_overall[0][0])*nx + (pt[1]-c_overall[0][1])*ny for pt in main_poly.exterior.coords]
         offset = max(projections) / 2
         road_centerline = affinity.translate(ext_path, xoff=nx*offset, yoff=ny*offset)
-        
-        p1, p2 = road_centerline.coords[0], road_centerline.coords[-1]
-        r1, r2 = (p1[0] - nx*(rw/2), p1[1] - ny*(rw/2)), (p2[0] - nx*(rw/2), p2[1] - ny*(rw/2))
-        r3, r4 = (p2[0] + nx*(rw/2), p2[1] + ny*(rw/2)), (p1[0] + nx*(rw/2), p1[1] + ny*(rw/2))
-        full_road_base = Polygon([r1, r2, r3, r4])
+        full_road_base = road_centerline.buffer(rw/2, cap_style=2)
     else:
-        p1, p2 = ext_path.coords[0], ext_path.coords[-1]
-        p3, p4 = (p2[0] + nx*rw, p2[1] + ny*rw), (p1[0] + nx*rw, p1[1] + ny*rw)
-        full_road_base = Polygon([p1, p2, p3, p4])
+        # Ponieważ ext_path podąża za kształtem krawędzi, wystarczy zwykły buffer!
+        # Używamy cap_style=2 (płaskie zakończenia), by po odcięciu do main_polygon było idealnie brzytwa.
+        full_road_base = ext_path.buffer(rw, cap_style=2)
 
     pub_edge = edges[st.session_state.public_road_idx]
     px1, px2 = pub_edge.coords[0], pub_edge.coords[1]
@@ -213,7 +224,9 @@ def run_design(road_width, road_pos, road_end, turnaround, t_size, last_area, cu
 
     if turnaround and road_poly.geom_type == 'Polygon':
         try:
-            c_line = road_centerline if is_middle else affinity.translate(ext_path, xoff=nx*(rw/2), yoff=ny*(rw/2))
+            if is_middle: c_line = road_centerline
+            else: c_line = affinity.translate(ext_path, xoff=nx*(rw/2), yoff=ny*(rw/2))
+                
             clipped_c = c_line.intersection(working_polygon)
             if clipped_c.geom_type == 'MultiLineString':
                 lines = list(clipped_c.geoms)
@@ -228,11 +241,16 @@ def run_design(road_width, road_pos, road_end, turnaround, t_size, last_area, cu
                 l = math.hypot(rx, ry)
                 rx, ry = (rx/l, ry/l) if l > 0 else (0, 0)
                 
+                # Zastosowanie lokalnego wektora do idealnego wyprostowania stempla
+                lnx, lny = -ry, rx
+                if lnx*nx + lny*ny < 0: lnx, lny = -lnx, -lny
+                
                 if is_middle:
-                    C1, C2 = (end_pt[0] + nx*(t_size/2), end_pt[1] + ny*(t_size/2)), (end_pt[0] - nx*(t_size/2), end_pt[1] - ny*(t_size/2))
+                    C1, C2 = (end_pt[0] + lnx*(t_size/2), end_pt[1] + lny*(t_size/2)), (end_pt[0] - lnx*(t_size/2), end_pt[1] - lny*(t_size/2))
                 else:
-                    C1 = (end_pt[0] - nx*(rw/2), end_pt[1] - ny*(rw/2))
-                    C2 = (C1[0] + nx*t_size, C1[1] + ny*t_size)
+                    P_edge = (end_pt[0] - lnx*(rw/2), end_pt[1] - lny*(rw/2))
+                    C1 = P_edge
+                    C2 = (C1[0] + lnx*t_size, C1[1] + lny*t_size)
                     
                 C3, C4 = (C2[0] + rx*t_size, C2[1] + ry*t_size), (C1[0] + rx*t_size, C1[1] + ry*t_size)
                 
@@ -324,7 +342,6 @@ with col1:
     if st.button("🚀 Wygeneruj Projekt Podziału", use_container_width=True, type="primary"):
         run_design(road_width, road_pos, road_end, turnaround, t_size, last_area, cut_angle, target_area, exact_count, remainder_mode)
 
-    # === SEKCJA RAPORTU ===
     if st.session_state.sub_parcels:
         st.markdown("### 📊 Raport Projektu")
         for i, p in enumerate(st.session_state.sub_parcels):
@@ -338,7 +355,6 @@ with col1:
         if st.session_state.remainder_parcel:
             st.markdown(f"**Reszta:** {st.session_state.remainder_parcel.area:.0f} m²")
 
-        # === EKSPORT DXF ===
         try:
             doc = ezdxf.new('R2010')
             msp = doc.modelspace()
@@ -386,7 +402,6 @@ with col2:
         trans = Transformer.from_crs(epsg, "EPSG:4326", always_xy=True)
         all_wgs_coords = []
         
-        # 1. Rysowanie Ewidencji (Krawędzie)
         for idx, edge in enumerate(st.session_state.edges):
             c_wgs = [trans.transform(x, y)[::-1] for x, y in edge.coords] 
             all_wgs_coords.extend(c_wgs)
@@ -397,7 +412,6 @@ with col2:
             
             folium.PolyLine(locations=c_wgs, color=color, weight=weight, tooltip=f"Krawędź nr: {idx}").add_to(m)
 
-        # 2. Rysowanie ZAPROJEKTOWANYCH DZIAŁEK (CAD STYLE + OPISY W ŚRODKU)
         if st.session_state.sub_parcels:
             for i, p in enumerate(st.session_state.sub_parcels):
                 p_geoms = p.geoms if hasattr(p, 'geoms') else [p]
@@ -406,7 +420,6 @@ with col2:
                         c_wgs = [trans.transform(x, y)[::-1] for x, y in g.exterior.coords]
                         folium.Polygon(locations=c_wgs, color='blue', weight=2, fill=False).add_to(m)
                         
-                        # ETYKIETA W CENTRUM DZIAŁKI (HTML z białym obrysem)
                         wgs_cent = trans.transform(g.centroid.x, g.centroid.y)[::-1]
                         label_html = f"""
                         <div style='font-family: Arial, sans-serif; font-size: 11px; font-weight: bold; color: black; text-align: center; text-shadow: 1px 1px 2px white, -1px -1px 2px white, 1px -1px 2px white, -1px 1px 2px white;'>
@@ -414,7 +427,6 @@ with col2:
                         </div>"""
                         folium.Marker(location=wgs_cent, icon=folium.DivIcon(html=label_html, icon_size=(100, 30), icon_anchor=(50, 15))).add_to(m)
         
-        # 3. Rysowanie Drogi
         if st.session_state.road_polygon:
             r_geoms = st.session_state.road_polygon.geoms if hasattr(st.session_state.road_polygon, 'geoms') else [st.session_state.road_polygon]
             for g in r_geoms:
@@ -422,7 +434,6 @@ with col2:
                     c_wgs = [trans.transform(x, y)[::-1] for x, y in g.exterior.coords]
                     folium.Polygon(locations=c_wgs, color='#ff8800', weight=2, fill=False).add_to(m)
                     
-        # 4. Rysowanie Resztówki
         if st.session_state.remainder_parcel:
             rem_geoms = st.session_state.remainder_parcel.geoms if hasattr(st.session_state.remainder_parcel, 'geoms') else [st.session_state.remainder_parcel]
             for g in rem_geoms:
@@ -437,19 +448,17 @@ with col2:
 
     st_data = st_folium(m, width=900, height=750)
     
-    # OBSŁUGA KLIKANIA MAPY
     if st_data['last_object_clicked_tooltip']:
         try:
             clicked_idx = int(st_data['last_object_clicked_tooltip'].replace("Krawędź nr: ", ""))
             if st.session_state.picking_mode == 'public':
                 st.session_state.public_road_idx = clicked_idx
-                st.session_state.picking_mode = 'Oczekiwanie' # Resetujemy, bo gminna jest tylko 1
+                st.session_state.picking_mode = 'Oczekiwanie'
                 st.rerun()
             elif st.session_state.picking_mode == 'inner':
-                # Wielokrotny wybór!
                 if clicked_idx in st.session_state.inner_road_indices:
                     st.session_state.inner_road_indices.remove(clicked_idx)
                 else:
                     st.session_state.inner_road_indices.append(clicked_idx)
-                st.rerun() # Przeładowujemy UI by krawędź zaświeciła się natychmiast
+                st.rerun()
         except: pass
