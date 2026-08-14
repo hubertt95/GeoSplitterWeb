@@ -20,7 +20,7 @@ if 'original_parcels' not in st.session_state:
         'original_parcels': [], 'main_polygon': None, 'edges': [],
         'public_road_idx': None, 'inner_road_indices': [],
         'sub_parcels': [], 'remainder_parcel': None, 'road_polygon': None,
-        'mega_remainder': None, # Nowa zmienna na Teren Wyłączony
+        'mega_remainder': None,
         'cut_lines': [], 'centroid_wgs84': [52.0, 19.0], 'zoom_start': 6,
         'picking_mode': 'Oczekiwanie', 'epsg_code': 'EPSG:2178'
     })
@@ -130,13 +130,31 @@ def fetch_data(ids_str):
             original_2000.append({'id': tid, 'geom': geom_2000, 'area': geom_2000.area})
 
     st.session_state.original_parcels = original_2000
-    main_poly = unary_union([p['geom'] for p in original_2000])
-    st.session_state.main_polygon = main_poly
     
+    # 1. Obszar całkowity (bez zmian)
+    st.session_state.main_polygon = unary_union([p['geom'] for p in original_2000])
+    
+    # 2. Pobieranie WSZYSTKICH krawędzi (zewnętrznych i wewnętrznych) bez duplikatów
     edges = []
-    if main_poly.geom_type == 'Polygon':
-        c = list(main_poly.exterior.coords)
-        for i in range(len(c) - 1): edges.append(LineString([c[i], c[i+1]]))
+    seen = set()
+    for orig in original_2000:
+        poly = orig['geom']
+        rings = [poly.exterior] + list(poly.interiors) if poly.geom_type == 'Polygon' else []
+        if poly.geom_type == 'MultiPolygon':
+            for p in poly.geoms:
+                rings.append(p.exterior)
+                rings.extend(list(p.interiors))
+                
+        for ring in rings:
+            c = list(ring.coords)
+            for i in range(len(c) - 1):
+                p1, p2 = c[i], c[i+1]
+                # Unikalny identyfikator odcinka (tolerancja do 2 miejsc po przecinku = 1 cm w EPSG:2000)
+                seg = tuple(sorted([(round(p1[0], 2), round(p1[1], 2)), (round(p2[0], 2), round(p2[1], 2))]))
+                if seg not in seen:
+                    seen.add(seg)
+                    edges.append(LineString([p1, p2]))
+                    
     st.session_state.edges = edges
     
     st.session_state.public_road_idx = None
@@ -145,18 +163,16 @@ def fetch_data(ids_str):
     st.session_state.road_polygon = None
     st.session_state.remainder_parcel = None
     st.session_state.mega_remainder = None
-    st.session_state.picking_mode = 'Oczekiwanie'
-    st.success(f"Pobrano {len(original_2000)} działek. Gotowe do wyboru krawędzi.")
+    st.success(f"Pobrano {len(original_2000)} działek. Krawędzie (wewn. i zewn.) gotowe.")
 
 # ==========================================
-# 3. GENEROWANIE KONCEPCJI (NA ŻĄDANIE)
+# 3. GENEROWANIE KONCEPCJI
 # ==========================================
 def run_design():
     if not st.session_state.main_polygon or st.session_state.public_road_idx is None or not st.session_state.inner_road_indices:
         st.warning("Przed przeliczeniem wskaż w panelu Drogę Gminną (1x) i Wewnętrzną (Wiele).")
         return
 
-    # --- POBIERANIE PARAMETRÓW ---
     road_pos = st.session_state.get('road_pos', "Przy krawędzi (Bok)")
     rw = st.session_state.get('road_width', 8.0)
     wA = st.session_state.get('road_wA', 4.0)
@@ -182,7 +198,6 @@ def run_design():
     st.session_state.sub_parcels, st.session_state.remainder_parcel, st.session_state.cut_lines = [], None, []
     st.session_state.mega_remainder = None
 
-    # --- WEKTORY DROGI WEWNĘTRZNEJ ---
     inner_lines = [edges[i] for i in sorted(st.session_state.inner_road_indices)]
     inner_path = unary_union(inner_lines)
     if inner_path.geom_type == 'MultiLineString':
@@ -193,12 +208,11 @@ def run_design():
     c_overall = list(ext_path.coords)
     dx_ov, dy_ov = c_overall[-1][0]-c_overall[0][0], c_overall[-1][1]-c_overall[0][1]
     l_len = math.hypot(dx_ov, dy_ov)
-    nx, ny = -dy_ov/l_len, dx_ov/l_len # Wektor normalny (do środka)
+    nx, ny = -dy_ov/l_len, dx_ov/l_len 
     
     cx, cy = main_poly.centroid.x - c_overall[0][0], main_poly.centroid.y - c_overall[0][1]
     if cx*nx + cy*ny < 0: nx, ny = -nx, -ny
 
-    # --- WEKTOR CIĘCIA I KIERUNEK ---
     pub_edge = edges[st.session_state.public_road_idx]
     px1, px2 = pub_edge.coords[0], pub_edge.coords[1]
     pdx, pdy = px2[0]-px1[0], px2[1]-px1[1]
@@ -212,7 +226,6 @@ def run_design():
     if (main_poly.centroid.x - pub_edge.centroid.x)*v_sweep[0] + (main_poly.centroid.y - pub_edge.centroid.y)*v_sweep[1] < 0:
         v_sweep = (-v_sweep[0], -v_sweep[1])
 
-    # === NOWOŚĆ: WYDZIELENIE STREFY PROJEKTOWEJ ===
     design_poly = main_poly
     if limit_zone and zone_area < main_poly.area * 0.95:
         front_p, back_p, _ = _cut_parcel(main_poly, v_cut, v_sweep, zone_area, cut_from_back=False)
@@ -220,25 +233,22 @@ def run_design():
             design_poly = front_p
             st.session_state.mega_remainder = back_p
 
-    # --- TWORZENIE BRYŁY DROGI ---
     if road_pos == "Środek Działki":
         projections = [(pt[0]-c_overall[0][0])*nx + (pt[1]-c_overall[0][1])*ny for pt in design_poly.exterior.coords]
         offset = max(projections) / 2
         road_centerline = affinity.translate(ext_path, xoff=nx*offset, yoff=ny*offset)
         full_road_base = road_centerline.buffer(rw/2, cap_style=2)
     elif road_pos == "Asymetrycznie względem wybranej osi":
-        # Rzutowanie w lewo i prawo od wskazanej osi
         p1, p2 = ext_path.coords[0], ext_path.coords[-1]
         r1 = (p1[0] + nx*wA, p1[1] + ny*wA)
         r2 = (p2[0] + nx*wA, p2[1] + ny*wA)
         r3 = (p2[0] - nx*wB, p2[1] - ny*wB)
         r4 = (p1[0] - nx*wB, p1[1] - ny*wB)
         full_road_base = Polygon([r1, r2, r3, r4])
-        rw = wA + wB # Korekta łącznej szerokości do placu
-    else: # Przy krawędzi (Bok)
+        rw = wA + wB 
+    else:
         full_road_base = ext_path.buffer(rw, cap_style=2)
 
-    # --- OSTATNIA DZIAŁKA ---
     back_parcel, working_polygon = None, design_poly
     if stop_at_last:
         back_parcel, working_polygon, _ = _cut_parcel(design_poly, v_cut, v_sweep, last_area, cut_from_back=True)
@@ -246,7 +256,6 @@ def run_design():
 
     road_poly = full_road_base.intersection(working_polygon)
 
-    # --- PLAC DO ZAWRACANIA ---
     if turnaround and road_poly.geom_type == 'Polygon':
         try:
             if road_pos == "Środek Działki": c_line = road_centerline
@@ -286,7 +295,6 @@ def run_design():
     net_poly = working_polygon.difference(road_poly)
     geoms = [net_poly] if net_poly.geom_type == 'Polygon' else net_poly.geoms
     
-    # --- PĘTLA PODZIAŁOWA ---
     for geom in geoms:
         rem_poly = geom
         cuts_needed = exact_count - 1 if exact_count else 999
@@ -345,7 +353,7 @@ with col_left:
 
     with st.expander("2. Krawędzie Odniesienia", expanded=True):
         if not st.session_state.edges:
-            st.info("Pobierz geometrię, aby wybrać krawędzie.")
+            st.info("Pobierz geometrię, aby wygenerować numery krawędzi.")
         else:
             edge_opts = list(range(len(st.session_state.edges)))
             if st.session_state.public_road_idx not in edge_opts: st.session_state.public_road_idx = None
@@ -387,71 +395,89 @@ with col_left:
             st.number_input("Powierzchnia strefy od drogi (m²):", min_value=100.0, step=100.0, value=3000.0, key='zone_area')
 
 
-# --- ŚRODKOWA KOLUMNA: Mapa Folium ---
+# --- ŚRODKOWA KOLUMNA: Mapa Folium z Warstwami ---
 with col_mid:
     m = folium.Map(location=st.session_state.centroid_wgs84, zoom_start=st.session_state.zoom_start, tiles="CartoDB positron")
+    
+    # Tworzenie grup warstw do panelu kontrolnego
+    fg_edges = folium.FeatureGroup(name="1. Krawędzie Ewidencyjne (Numery)", show=True)
+    fg_design = folium.FeatureGroup(name="2. Zaprojektowane Działki", show=True)
+    fg_road = folium.FeatureGroup(name="3. Projektowana Droga", show=True)
+    fg_rem = folium.FeatureGroup(name="4. Resztówki / Teren Wyłączony", show=True)
     
     if st.session_state.main_polygon:
         epsg = st.session_state.get('epsg_code', 'EPSG:2178')
         trans = Transformer.from_crs(epsg, "EPSG:4326", always_xy=True)
         all_wgs_coords = []
         
-        # 1. Mega Resztówka (Teren Wyłączony)
+        # 1. Mega Resztówka (Teren Wyłączony) -> dodane do fg_rem
         if st.session_state.mega_remainder:
             r_geoms = st.session_state.mega_remainder.geoms if hasattr(st.session_state.mega_remainder, 'geoms') else [st.session_state.mega_remainder]
             for g in r_geoms:
                 if g.geom_type == 'Polygon':
                     c_wgs = [trans.transform(x, y)[::-1] for x, y in g.exterior.coords]
-                    folium.Polygon(locations=c_wgs, color='green', weight=2, fill=True, fill_opacity=0.1).add_to(m)
+                    folium.Polygon(locations=c_wgs, color='green', weight=2, fill=True, fill_opacity=0.1).add_to(fg_rem)
                     wgs_cent = trans.transform(g.centroid.x, g.centroid.y)[::-1]
                     label_html = f"<div style='font-family: Arial; font-size: 10px; font-weight: bold; color: green; text-align: center; text-shadow: 1px 1px 1px white;'>Teren Wyłączony<br>{g.area:.0f} m²</div>"
-                    folium.Marker(location=wgs_cent, icon=folium.DivIcon(html=label_html, icon_size=(100, 30), icon_anchor=(50, 15))).add_to(m)
+                    folium.Marker(location=wgs_cent, icon=folium.DivIcon(html=label_html, icon_size=(100, 30), icon_anchor=(50, 15))).add_to(fg_rem)
 
+        # 2. Rysowanie krawędzi (Teraz bardzo cienkie i szare) -> dodane do fg_edges
         for idx, edge in enumerate(st.session_state.edges):
             c_wgs = [trans.transform(x, y)[::-1] for x, y in edge.coords] 
             all_wgs_coords.extend(c_wgs)
-            color, weight = '#777777', 3
+            color, weight = '#999999', 2  # Cienki szary
             if idx == st.session_state.public_road_idx: color, weight = 'red', 5
             elif idx in st.session_state.inner_road_indices: color, weight = 'orange', 5
-            folium.PolyLine(locations=c_wgs, color=color, weight=weight).add_to(m)
+            folium.PolyLine(locations=c_wgs, color=color, weight=weight).add_to(fg_edges)
             
             mid_pt = edge.interpolate(0.5, normalized=True)
             mid_wgs = trans.transform(mid_pt.x, mid_pt.y)[::-1]
             label_html = f"<div style='font-family: Arial; font-size: 11px; font-weight: bold; color: white; background-color: {color}; border: 1px solid white; border-radius: 12px; width: 24px; height: 24px; text-align: center; line-height: 22px; box-shadow: 2px 2px 3px rgba(0,0,0,0.4);'>{idx}</div>"
-            folium.Marker(location=mid_wgs, icon=folium.DivIcon(html=label_html, icon_size=(24, 24), icon_anchor=(12, 12))).add_to(m)
+            folium.Marker(location=mid_wgs, icon=folium.DivIcon(html=label_html, icon_size=(24, 24), icon_anchor=(12, 12))).add_to(fg_edges)
 
+        # 3. Zaprojektowane działki -> dodane do fg_design
         if st.session_state.sub_parcels:
             for i, p in enumerate(st.session_state.sub_parcels):
                 p_geoms = p.geoms if hasattr(p, 'geoms') else [p]
                 for g in p_geoms:
                     if g.geom_type == 'Polygon':
                         c_wgs = [trans.transform(x, y)[::-1] for x, y in g.exterior.coords]
-                        folium.Polygon(locations=c_wgs, color='blue', weight=2, fill=False).add_to(m)
+                        folium.Polygon(locations=c_wgs, color='blue', weight=2, fill=False).add_to(fg_design)
                         wgs_cent = trans.transform(g.centroid.x, g.centroid.y)[::-1]
                         label_html = f"<div style='font-family: Arial; font-size: 11px; font-weight: bold; color: black; text-align: center; text-shadow: 1px 1px 2px white, -1px -1px 2px white, 1px -1px 2px white, -1px 1px 2px white;'>Dz. {i+1}<br>{p.area:.0f}</div>"
-                        folium.Marker(location=wgs_cent, icon=folium.DivIcon(html=label_html, icon_size=(100, 30), icon_anchor=(50, 15))).add_to(m)
+                        folium.Marker(location=wgs_cent, icon=folium.DivIcon(html=label_html, icon_size=(100, 30), icon_anchor=(50, 15))).add_to(fg_design)
         
+        # 4. Droga wewnętrzna -> dodane do fg_road
         if st.session_state.road_polygon:
             r_geoms = st.session_state.road_polygon.geoms if hasattr(st.session_state.road_polygon, 'geoms') else [st.session_state.road_polygon]
             for g in r_geoms:
                 if g.geom_type == 'Polygon':
                     c_wgs = [trans.transform(x, y)[::-1] for x, y in g.exterior.coords]
-                    folium.Polygon(locations=c_wgs, color='#ff8800', weight=2, fill=False).add_to(m)
+                    folium.Polygon(locations=c_wgs, color='#ff8800', weight=2, fill=False).add_to(fg_road)
                     
+        # 5. Zwykła Resztówka -> dodane do fg_rem
         if st.session_state.remainder_parcel:
             rem_geoms = st.session_state.remainder_parcel.geoms if hasattr(st.session_state.remainder_parcel, 'geoms') else [st.session_state.remainder_parcel]
             for g in rem_geoms:
                 if g.geom_type == 'Polygon':
                     c_wgs = [trans.transform(x, y)[::-1] for x, y in g.exterior.coords]
-                    folium.Polygon(locations=c_wgs, color='red', weight=2, dash_array='5, 5', fill=False).add_to(m)
+                    folium.Polygon(locations=c_wgs, color='red', weight=2, dash_array='5, 5', fill=False).add_to(fg_rem)
                     wgs_cent = trans.transform(g.centroid.x, g.centroid.y)[::-1]
                     label_html = f"<div style='font-family: Arial; font-size: 10px; font-weight: bold; color: red; text-align: center; text-shadow: 1px 1px 1px white;'>Reszta<br>{g.area:.0f}</div>"
-                    folium.Marker(location=wgs_cent, icon=folium.DivIcon(html=label_html, icon_size=(80, 30), icon_anchor=(40, 15))).add_to(m)
+                    folium.Marker(location=wgs_cent, icon=folium.DivIcon(html=label_html, icon_size=(80, 30), icon_anchor=(40, 15))).add_to(fg_rem)
             
         if all_wgs_coords: m.fit_bounds(all_wgs_coords)
 
-    st_folium(m, width=700, height=800, returned_objects=[])
+    # Dodanie grup do mapy
+    fg_edges.add_to(m)
+    fg_design.add_to(m)
+    fg_road.add_to(m)
+    fg_rem.add_to(m)
+    
+    # Przycisk włączania/wyłączania warstw na mapie (prawy górny róg)
+    folium.LayerControl(position='topright').add_to(m)
 
+    st_folium(m, width=700, height=800, returned_objects=[])
 
 # --- PRAWA KOLUMNA: Raport ---
 with col_right:
@@ -493,7 +519,6 @@ with col_right:
                     except: pass
 
         st.markdown("---")
-        # Przycisk Eksportu DXF
         try:
             doc = ezdxf.new('R2010')
             msp = doc.modelspace()
@@ -502,7 +527,7 @@ with col_right:
             doc.layers.add(name='WYMIARY', color=1)
             doc.layers.add(name='OPISY', color=7)
             doc.layers.add(name='EWIDENCJA', color=8).off()
-            doc.layers.add(name='TEREN_WYLACZONY', color=4) # Cyjan dla mega reszty
+            doc.layers.add(name='TEREN_WYLACZONY', color=4)
 
             def add_to_dxf(geom, layer, label=None):
                 geoms = geom.geoms if hasattr(geom, 'geoms') else [geom]
@@ -514,7 +539,7 @@ with col_right:
 
             for orig in st.session_state.original_parcels: add_to_dxf(orig['geom'], 'EWIDENCJA')
             if st.session_state.road_polygon: add_to_dxf(st.session_state.road_polygon, 'DROGA_PROJ')
-            if st.session_state.mega_remainder: add_to_dxf(st.session_state.mega_remainder, 'TEREN_WYLACZONY', f"WYlACZONY pow. {st.session_state.mega_remainder.area:.0f} m2")
+            if st.session_state.mega_remainder: add_to_dxf(st.session_state.mega_remainder, 'TEREN_WYLACZONY', f"WYLACZONY pow. {st.session_state.mega_remainder.area:.0f} m2")
 
             for i, p in enumerate(st.session_state.sub_parcels):
                 p_geoms = p.geoms if hasattr(p, 'geoms') else [p]
@@ -538,4 +563,4 @@ with col_right:
         except Exception as e: st.error(f"Błąd przygotowania DXF: {e}")
         
     else:
-        st.write("Wskaż krawędzie w panelu po lewej, by wygenerować raport.")
+        st.write("Wskaż krawędzie w panelu po lewej i kliknij 'Przelicz Projekt'.")
